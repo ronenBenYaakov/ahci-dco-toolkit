@@ -1,14 +1,31 @@
-# Kernel Module Build Artifacts
+# ==========================================
+# Linux Kernel Module Build Artifacts
+# ==========================================
 *.o
 *.ko
 *.mod
 *.mod.c
 *.mod.o
-*.o.cmd
-*.ko.cmd
+.tmp_versions/
 .*.cmd
 modules.order
 Module.symvers
-.tmp_versions/
-.built-in.a.*
-.cache.mk
+*.unsigned
+
+# ==========================================
+# Stray Extensionless Test / Debug Files
+# ==========================================
+/checksum
+/command
+/device
+/dw1
+/feature_low
+/fis_type
+/lba0
+/lba1
+/lba2
+/magic
+/pm_port_c
+/reserved
+/version
+.venv
