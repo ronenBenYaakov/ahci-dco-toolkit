@@ -10,45 +10,72 @@
 
 ## Core Architecture & Algorithmic Breakdown
 
-The toolkit relies on six distinct architectural pillars to ensure absolute operational stealth, universal compatibility, and execution integrity:
+The toolkit relies on seven distinct architectural pillars to ensure absolute operational stealth, universal compatibility, and execution integrity:
 
-### 1. MMIO Piggybacking & Universal ABAR Resolution
+### 1. Universal PCI ABAR Resolution & Fallback Engine
 
-To interact with the AHCI controller's memory space without creating new telemetry footprints or conflicting with active kernel driver mappings, the toolkit utilizes an advanced MMIO discovery pipeline:
+To interface with the AHCI controller's memory space without relying on internal `libata` driver state structures that vary across kernel versions:
 
-* **The Piggybacked Approach (`host->iomap`):** Initially designed to completely avoid manual `ioremap()` calls, this technique iterates through active PCI SATA controllers, retrieves the driver data state (`pci_get_drvdata`), and hooks directly into `host->iomap[5]`. This leverages the pre-existing virtual address space already mapped by `libata` during system boot.
-* **Universal PCI Scanner & Fallback Engine:** To handle kernel version differences or hypervisor environments where internal driver structures vary, the framework incorporates a universal bus scanner. It inspects all Mass Storage controllers (`Base Class 0x01`), dynamically resolves BAR5 via `pci_resource_start()`, and falls back to hypervisor-aware memory maps (such as VirtualBox ICH9 ABAR at `0xe1900000ULL`) when necessary.
+* **Dynamic PCI Scanner:** Iterates through active PCI storage controllers (`PCI_CLASS_STORAGE_SATA`), resolving Base Address Register 5 (BAR5) dynamically via `pci_resource_start()`.
+* **Hypervisor-Aware Fallback:** If dynamic scanning is restricted or missed in specialized environments (such as VirtualBox), the engine seamlessly falls back to pre-defined architectural maps (e.g., ICH9 ABAR at `0xe1900000ULL`) via standard `ioremap()`.
 
-### 2. Pure-MMIO Execution Engine (Bypassing `libata`)
+### 2. Manual Direct Page Table Walk Engine (`CR3` Traversal)
 
-Traditional storage operations route through the kernel's `libata` driver and block layer, leaving deep telemetry traces in I/O queues and scheduler logs.
+To map controller-allocated physical addresses (like command lists and slot buffers) directly into kernel virtual memory without triggering standard kernel tracking hooks:
 
-* **The Algorithm:** The toolkit bypasses kernel block abstractions entirely. It constructs native command frames—including SATA Host-to-Device Register FIS (`0x27`) and PRDT (Physical Region Descriptor Table) entries—and injects them directly into arbitrary hardware command slots (Slot 31) in the Port Command List.
+* **Hardware CR3 Inspection:** Reads the active page directory root via `read_cr3_pa()`.
+* **Low-Level 4-Level Traversal:** Manually walks the full paging hierarchy ($\text{PGD} \rightarrow \text{P4D} \rightarrow \text{Pud} \rightarrow \text{PMD} \rightarrow \text{PTE}$), handling huge pages (`_PAGE_PSE`) to resolve physical addresses straight to usable virtual MMIO pointers.
 
-### 3. Hardware Interrupt Masking (`PxIE` Blinding)
+### 3. Zero-Allocation Reused Buffer Architecture
 
-The Linux kernel monitors drive activity primarily through hardware interrupts. When a command completes, the controller fires an interrupt handled by `libata`'s Interrupt Service Routine (ISR).
+Traditional kernel drivers allocate dedicated memory buffers via `kmalloc` or `dma_alloc_coherent`, leaving heavy forensic footprints.
 
-* **The Algorithm:** Immediately prior to firing a command slot, the module reads and backs up the Port Interrupt Enable (`PxIE`) register and writes `0` to it. This commands the AHCI controller to withhold all interrupt signals for that port from the CPU. The kernel's ISR remains completely blind while the command executes out-of-band via manual polling of the Task File Data (`PxTFD`) and Command Issue (`PxCI`) registers.
+* **Controller Piggybacking:** The module queries the active AHCI Command List (`PxCLB`) established by the firmware/BIOS.
+* **Buffer Borrowing:** It maps existing pre-allocated command slots (Slot 0 and Slot 31), extracting their existing Command Table Buffer Addresses (`CTBA`) and Physical Region Descriptor Table (`PRDT`) fields to act as scratchpads, ensuring **zero new memory allocations**.
 
-### 4. Transient Execution (Zero-Resident Module Footprint)
+### 4. Hardware Interrupt Masking (`PxIE` Blinding) & Polling
 
-Standard kernel modules remain resident in memory, showing up in `lsmod`, `/proc/modules`, and `/sys/module/`, making them trivial to detect via host-based introspection.
+The Linux kernel monitors drive activity primarily through hardware interrupts handled by `libata`.
 
-* **The Algorithm:** The module utilizes a transient execution model. The core DCO micro-trim logic is housed entirely within the module initialization (`__init`) function. Once the hardware operations successfully commit and tracks are scrubbed, the function returns **`-ENODEV`** ("No such device"). This forces the kernel module loader to instantly abort registration, discarding the binary from memory. The result is **zero persistent kernel module footprint** while the hardware configuration persists in the drive's non-volatile NVRAM.
+* **The Algorithm:** Immediately before issuing a command, the module backs up and zeroes out the Port Interrupt Enable (`PxIE`) register. This commands the AHCI controller to withhold all completion interrupts from the CPU. The framework then executes an active polling loop against the Task File Data (`PxTFD`) and Command Issue (`PxCI`) registers to monitor completion out-of-band.
 
-### 5. DCO Micro-Trim Sequence
+### 5. Transient Execution (Zero-Resident Module Footprint)
 
-The capacity manipulation sequence is split into two precise phases:
+Standard kernel modules remain resident in memory (`lsmod`, `/proc/modules`), making them trivial to detect.
 
-* **Phase 1 (Tail Sector Inspection):** Issues a native `READ DMA EXT` (`0x25`) command targeting the ultimate sector of the drive (`Native Max LBA - 1`). It validates drive responsiveness and inspects structural boundaries (e.g., verifying GPT backup headers) before modification.
-* **Phase 2 (Capacity Truncation):** Issues a Device Configuration Set (`0xB1` / `0xC2`) command with a reduced maximum LBA boundary (`Native Max LBA - 1000 sectors`). This permanently clips the addressable capacity at the hardware firmware level.
+* **The Algorithm:** The entire exploitation and DCO payload executes sequentially inside the module initialization (`__init`) function. Upon completion, the module returns **`-ENODEV`**, forcing the kernel module loader to instantly abort registration and discard the binary from memory. The hardware configuration remains permanently altered in non-volatile NVRAM while software memory traces vanish.
 
-### 6. Memory Forensics & CPU Cache Sanitization
+### 6. DCO Micro-Trim Sequence
 
-Advanced memory dumpers and cold-boot forensic tools can recover sensitive payloads, command structures, and target LBAs from physical RAM and CPU cache lines post-execution.
+The capacity manipulation workflow executes in two controlled phases:
 
-* **The Algorithm:**
-  * **Cache Flushing:** Employs `clflush_cache_range()` to forcefully push dirty cache lines out to physical RAM and invalidate L1/L2/L3 CPU caches.
-  * **Explicit Memory Wiping:** Uses `memzero_explicit()` to securely overwrite all allocation pages and command headers with zeroes, ensuring no compiler optimizations eliminate the wipe.
-  * **Link Noise Elimination:** Reads and clears the Port Error Register (`PxSERR`) and pending interrupt flags (`PxIS`) post-execution to prevent `libata` from throwing `qc_active` warning artifacts when the physical link re-synchronizes.
+* **Phase 1 (Tail Sector Inspection):** Issues a native `READ DMA EXT` (`0x25`) command targeting the ultimate sector of the drive (`Native Max LBA - 1`) to verify drive responsiveness and inspect structural boundaries (e.g., validating backup GPT headers).
+* **Phase 2 (Capacity Truncation):** Issues a Device Configuration Set (`0xB1` / `0xC2`) command with a reduced maximum LBA boundary (`STEALTH_MAX_LBA`), permanently clipping the addressable capacity at the hardware firmware level.
+
+### 7. Memory Forensics & CPU Cache Sanitization
+
+Advanced forensic tools can extract sensitive payloads, target LBAs, and command structures from physical RAM and CPU cache lines post-execution.
+
+* **Cache Flushing:** Employs `clflush_cache_range()` to forcefully push dirty cache lines out to physical RAM and invalidate L1/L2/L3 CPU caches.
+* **Explicit Memory Wiping:** Uses `memzero_explicit()` to securely overwrite all shared control buffers with zeroes.
+* **Link Noise Elimination:** Clears the Port Error Register (`PxSERR`) and pending interrupt flags (`PxIS`) post-execution to prevent `libata` from throwing `qc_active` warnings when the link re-synchronizes.
+
+---
+
+## Configuration Constants
+
+Operational parameters can be fine-tuned via `#define` directives in the source code:
+
+| Constant | Default Value | Description |
+| --- | --- | --- |
+| `VBOX_AHCI_FALLBACK_PHYS` | `0xe1900000ULL` | Fallback physical ABAR address for VirtualBox environments. |
+| `AHCI_PORT_NUM` | `0` | Target SATA port index to manipulate. |
+| `NATIVE_MAX_LBA` | `2097152ULL` | Baseline maximum Logical Block Address of the disk. |
+| `TAIL_TRIM_SECTORS` | `1000ULL` | Number of sectors to trim from the tail end. |
+| `STEALTH_MAX_LBA` | `NATIVE_MAX_LBA - 1000ULL` | The new restricted maximum LBA enforced via DCO. |
+
+---
+
+## Disclaimer
+
+> **Educational & Research Notice**: This module interacts directly with low-level storage controller hardware and modifies disk configuration overlays. Improper use or incorrect LBA calculations can result in data loss or filesystem corruption. Use strictly in controlled laboratory environments.
