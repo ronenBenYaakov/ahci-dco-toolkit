@@ -5,12 +5,14 @@
 #include <linux/delay.h>
 #include <linux/gfp.h>
 #include <linux/mm.h>
+#include <linux/pci.h>
+#include <linux/libata.h>
 #include <asm/cacheflush.h>
 
 /* ------------------------------------------------------------------ *
- *  AHCI MMIO base (BAR5 / ABAR) - Pure Bare-Metal Access
+ *  AHCI Port Configuration & Constants
  * ------------------------------------------------------------------ */
-#define AHCI_ABAR_PHYS    0xe1900000ULL
+#define VBOX_AHCI_FALLBACK_PHYS 0xe1900000ULL  /* Fallback ABAR for VirtualBox */
 #define AHCI_PORT_NUM     0
 #define AHCI_PORT_BASE    (0x100 + (AHCI_PORT_NUM) * 0x80)
 
@@ -34,7 +36,7 @@
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("System Researcher");
-MODULE_DESCRIPTION("Pure MMIO Transient Stealth DCO Module");
+MODULE_DESCRIPTION("Pure MMIO Transient Stealth DCO Module with Universal PCI Scanner & Fallback");
 
 struct sata_fis_h2d {
     u8 fis_type;
@@ -63,6 +65,51 @@ struct ahci_prdt_entry {
 } __packed;
 
 /* ------------------------------------------------------------------ *
+ *  Universal PCI ABAR Resolver with Hypervisor Fallback
+ * ------------------------------------------------------------------ */
+static void __iomem *get_universal_ahci_mmio(void)
+{
+    struct pci_dev *pdev = NULL;
+    resource_size_t abar_phys;
+    void __iomem *mmio = NULL;
+
+    pr_info("[STEALTH_DCO] [*] Scanning PCI bus for storage controllers...\n");
+
+    while ((pdev = pci_get_device(PCI_ANY_ID, PCI_ANY_ID, pdev)) != NULL) {
+        u32 pci_class = pdev->class;
+        pr_info("[STEALTH_DCO] [*] Found device %s: class=0x%06x\n", pci_name(pdev), pci_class);
+
+        /* Check if Base Class is Mass Storage (0x01) */
+        if ((pci_class >> 16) == 0x01) {
+            abar_phys = pci_resource_start(pdev, 5);
+            if (abar_phys) {
+                pr_info("[STEALTH_DCO] [+] Found storage controller %s with BAR5 at 0x%llx\n",
+                        pci_name(pdev), (unsigned long long)abar_phys);
+                
+                mmio = ioremap(abar_phys, 0x1100);
+                if (mmio) {
+                    pci_dev_put(pdev);
+                    return mmio;
+                }
+            }
+        }
+    }
+
+    /* Fallback for VirtualBox / emulated environments */
+    pr_warn("[STEALTH_DCO] [!] Dynamic PCI scan missed active BAR5. Using fallback ABAR: 0x%llx\n", 
+            VBOX_AHCI_FALLBACK_PHYS);
+    
+    mmio = ioremap(VBOX_AHCI_FALLBACK_PHYS, 0x1100);
+    if (mmio) {
+        pr_info("[STEALTH_DCO] [+] Successfully mapped fallback ABAR at 0x%llx\n", VBOX_AHCI_FALLBACK_PHYS);
+        return mmio;
+    }
+
+    pr_err("[STEALTH_DCO] [-] Fatal: Failed to locate or map AHCI controller BAR5 via scan and fallback.\n");
+    return NULL;
+}
+
+/* ------------------------------------------------------------------ *
  *  Helper: Robust slot execution with verbose status logging
  * ------------------------------------------------------------------ */
 static int execute_ahci_slot_stealth(void *port_base, int slot, bool is_dco_set)
@@ -72,7 +119,7 @@ static int execute_ahci_slot_stealth(void *port_base, int slot, bool is_dco_set)
 
     pr_info("[STEALTH_DCO] [+] Preparing slot %d execution (DCO Set: %s)\n", slot, is_dco_set ? "YES" : "NO");
 
-    /* 1. Mask port interrupts to blind libata's ISR */
+    /* 1. Mask port interrupts to blind host ISR */
     ie_orig = readl((char *)port_base + AHCI_PxIE);
     writel(0, (char *)port_base + AHCI_PxIE);
     wmb();
@@ -94,7 +141,7 @@ static int execute_ahci_slot_stealth(void *port_base, int slot, bool is_dco_set)
             /* Clear pending status flags */
             writel(readl((char *)port_base + AHCI_PxIS), (char *)port_base + AHCI_PxIS);
             
-            /* Clear SERR post-execution to prevent post-exit link noise */
+            /* Clear SERR post-execution to prevent link noise */
             serr_val = readl((char *)port_base + AHCI_PxSERR);
             writel(serr_val, (char *)port_base + AHCI_PxSERR);
             wmb();
@@ -108,7 +155,6 @@ static int execute_ahci_slot_stealth(void *port_base, int slot, bool is_dco_set)
         msleep(10);
     }
     
-    /* Cleanup on timeout */
     pr_err("[STEALTH_DCO] [-] ERROR: Slot %d timed out! PxTFD: 0x%08x\n", slot, readl((char *)port_base + AHCI_PxTFD));
     
     writel(readl((char *)port_base + AHCI_PxIS), (char *)port_base + AHCI_PxIS);
@@ -119,7 +165,7 @@ static int execute_ahci_slot_stealth(void *port_base, int slot, bool is_dco_set)
 }
 
 /* ------------------------------------------------------------------ *
- *  Init (Transient Execution: Returns -ENODEV to avoid lsmod footprint)
+ *  Init (Transient Execution with Universal Scanner)
  * ------------------------------------------------------------------ */
 static int __init ahci_stealth_dco_init(void)
 {
@@ -140,14 +186,14 @@ static int __init ahci_stealth_dco_init(void)
     u8 *sector_buf;
 
     pr_info("[STEALTH_DCO] ==================================================\n");
-    pr_info("[STEALTH_DCO] ---- TRANSIENT PURE MMIO DCO START ----\n");
+    pr_info("[STEALTH_DCO] ---- UNIVERSAL SCANNER TRANSIENT DCO START ----\n");
     pr_info("[STEALTH_DCO] ==================================================\n");
 
-    /* Map ABAR directly */
-    abar_base = ioremap(AHCI_ABAR_PHYS, 0x1100);
+    /* 1. Resolve ABAR mapping via universal scanner or fallback */
+    abar_base = get_universal_ahci_mmio();
     if (!abar_base) {
-        pr_err("[STEALTH_DCO] FATAL: ioremap failed for ABAR 0x%llx\n", AHCI_ABAR_PHYS);
-        return -ENOMEM;
+        pr_err("[STEALTH_DCO] FATAL: Failed to acquire ABAR mapping\n");
+        return -ENODEV;
     }
     port_base = (void *)((char *)abar_base + AHCI_PORT_BASE);
 
@@ -268,44 +314,31 @@ static int __init ahci_stealth_dco_init(void)
             pr_err("[STEALTH_DCO] [-] Controller rejected DCO command.\n");
             ret = -EIO;
         } else {
-            pr_info("[STEALTH_DCO] [++] SUCCESS: DCO applied silently via hardware masking.\n");
-            ret = 0; /* Success */
+            pr_info("[STEALTH_DCO] [++] SUCCESS: DCO applied successfully.\n");
+            ret = 0;
         }
     } else {
         ret = -EIO;
     }
 
 out:
-    /* Forensic Memory Scrubbing: Wipe all payloads before freeing */
+    /* Forensic Memory Scrubbing & Cache Sanitization */
     if (slot_virt) {
-        /* Flush command slot from CPU cache lines before zeroing */
         clflush_cache_range(slot_virt, 32);
         memset(slot_virt, 0, 32);
-        clflush_cache_range(slot_virt, 32); // Flush the zeroes as well
+        clflush_cache_range(slot_virt, 32);
         memunmap(slot_virt);
     }
     if (ctba_virt) {
-        /* Flush CTBA page from CPU caches (L1/L2/L3) */
         clflush_cache_range(ctba_virt, PAGE_SIZE);
-        
-        /* Securely wipe RAM contents */
         memzero_explicit(ctba_virt, PAGE_SIZE);
-        
-        /* Flush the cleared state to physical RAM */
         clflush_cache_range(ctba_virt, PAGE_SIZE);
-        
         free_page(ctba_page);
     }
     if (data_virt) {
-        /* Flush data/sector buffer page from CPU caches */
         clflush_cache_range(data_virt, 512);
-        
-        /* Securely wipe sector payload residue */
         memzero_explicit(data_virt, 512);
-        
-        /* Flush the zeroes */
         clflush_cache_range(data_virt, 512);
-        
         free_page(data_page);
     }
     if (abar_base) {
@@ -314,18 +347,10 @@ out:
 
     pr_info("[STEALTH_DCO] ---- TRANSIENT EXECUTION FINISHED (ret=%d) ----\n", ret);
 
-    /* 
-     * STEALTH TRICK: Return -ENODEV on success. 
-     * The task is completed and hardware configured, but the kernel 
-     * immediately aborts module registration -> 0 footprint in lsmod!
-     */
     return (ret == 0) ? -ENODEV : ret;
 }
 
-static void __exit ahci_stealth_dco_exit(void)
-{
-    /* Unused because module is never resident */
-}
+static void __exit ahci_stealth_dco_exit(void) {}
 
 module_init(ahci_stealth_dco_init);
 module_exit(ahci_stealth_dco_exit);

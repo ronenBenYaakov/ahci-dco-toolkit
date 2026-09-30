@@ -32,7 +32,7 @@ if make > /dev/null 2>&1; then
   echo -e "${GREEN}[+] BUILD SUCCESSFUL:${NC} Compilation clean and verified."
 else
   echo -e "${RED}[-] BUILD FAILED:${NC} Check your C source code for syntax errors."
-  make
+  sudo make
   exit 1
 fi
 
@@ -56,7 +56,7 @@ fi
 echo -e "\n${YELLOW}[*] Step 4: Auditing Kernel Logs & Link Noise (`dmesg`)...${NC}"
 DMESG_OUTPUT=$(dmesg | grep "STEALTH_DCO")
 
-if echo "$DMESG_OUTPUT" | grep -q "SUCCESS: DCO applied silently"; then
+if echo "$DMESG_OUTPUT" | grep -q "DCO applied successfully"; then
   echo -e "${GREEN}[+] PASS:${NC} DCO micro-trim command executed and confirmed by hardware."
 else
   echo -e "${RED}[-] FAIL:${NC} DCO success signature missing from kernel logs."
