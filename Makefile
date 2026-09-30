@@ -1,12 +1,10 @@
-obj-m += ahci_cmd_builder.o
-obj-m += ahci_decoder.o
-obj-m += ahci_dump.o
+obj-m += stealth_dco.o
+stealth_dco-objs := main.o mmio_audit.o ahci_engine.o
 
 PWD := $(shell pwd)
-KDIR := /lib/modules/$(shell uname -r)/build
 
 all:
-	$(MAKE) -C $(KDIR) M=$(PWD) modules
+	make -C /lib/modules/$(shell uname -r)/build M=$(PWD) modules
 
 clean:
-	$(MAKE) -C $(KDIR) M=$(PWD) clean
+	make -C /lib/modules/$(shell uname -r)/build M=$(PWD) clean

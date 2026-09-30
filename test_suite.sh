@@ -10,9 +10,9 @@ PURPLE='\033[0;35m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-MODULE="ahci_cmd_builder.ko"
-MODULE_NAME="ahci_cmd_builder"
-SOURCE_FILE="ahci_cmd_builder.c"
+MODULE="stealth_dco.ko"
+MODULE_NAME="stealth_dco"
+SOURCE_FILES="main.c mmio_audit.c ahci_engine.c stealth_dco.h"
 
 if [ "$EUID" -ne 0 ]; then
   echo -e "${RED}[-] Error: This script must be executed with root privileges (sudo).${NC}"
@@ -27,9 +27,9 @@ echo -e "${CYAN}${BOLD}╚══════════════════
 echo -e "\n${YELLOW}[*] Step 1: Compiling kernel module ($MODULE)...${NC}"
 make clean > /dev/null 2>&1
 if make > /dev/null 2>&1; then
-  echo -e "${GREEN}[+] BUILD SUCCESSFUL:${NC} Compilation clean and verified."
+  echo -e "${GREEN}[+] BUILD SUCCESSFUL:${NC} Modular compilation clean and verified."
 else
-  echo -e "${RED}[-] BUILD FAILED:${NC} Check your C source code for syntax errors."
+  echo -e "${RED}[-] BUILD FAILED:${NC} Check your C source files for syntax errors."
   exit 1
 fi
 
@@ -83,9 +83,9 @@ HAS_GET_PAGE=0
 HAS_FREE_PAGE=0
 HAS_METHOD2_LOGIC=0
 
-if grep -q "__get_free_page" "$SOURCE_FILE"; then HAS_GET_PAGE=1; fi
-if grep -q "free_page" "$SOURCE_FILE"; then HAS_FREE_PAGE=1; fi
-if grep -q "execute_method2_onchip_mmio_audit" "$SOURCE_FILE" && grep -q "INTEL_AHCI_VENDOR_SCRATCH_OFFSET" "$SOURCE_FILE"; then HAS_METHOD2_LOGIC=1; fi
+if grep -q "__get_free_page" $SOURCE_FILES; then HAS_GET_PAGE=1; fi
+if grep -q "free_page" $SOURCE_FILES; then HAS_FREE_PAGE=1; fi
+if grep -q "execute_method2_onchip_mmio_audit" $SOURCE_FILES && grep -q "INTEL_AHCI_VENDOR_SCRATCH_OFFSET" $SOURCE_FILES; then HAS_METHOD2_LOGIC=1; fi
 
 if [ "$HAS_GET_PAGE" -eq 0 ] && [ "$HAS_FREE_PAGE" -eq 0 ] && [ "$HAS_METHOD2_LOGIC" -eq 1 ]; then
   echo -e "${GREEN}[+] PASS:${NC} Method 2 on-chip MMIO validation successful!"
@@ -116,9 +116,9 @@ echo -e "\n${BLUE}[*] Step 9: Full Heap & Allocator Isolation Audit...${NC}"
 HAS_KMALLOC=0
 HAS_KZALLOC=0
 HAS_VZALLOC=0
-if grep -q "kmalloc" "$SOURCE_FILE"; then HAS_KMALLOC=1; fi
-if grep -q "kzalloc" "$SOURCE_FILE"; then HAS_KZALLOC=1; fi
-if grep -q "vzalloc" "$SOURCE_FILE"; then HAS_VZALLOC=1; fi
+if grep -q "kmalloc" $SOURCE_FILES; then HAS_KMALLOC=1; fi
+if grep -q "kzalloc" $SOURCE_FILES; then HAS_KZALLOC=1; fi
+if grep -q "vzalloc" $SOURCE_FILES; then HAS_VZALLOC=1; fi
 
 if [ "$HAS_KMALLOC" -eq 0 ] && [ "$HAS_KZALLOC" -eq 0 ] && [ "$HAS_VZALLOC" -eq 0 ]; then
   echo -e "${GREEN}[+] PASS:${NC} Complete heap allocator isolation verified!"
@@ -138,7 +138,6 @@ fi
 
 echo -e "\n${PURPLE}[*] Step 11 (Elite Test): Kernel Taint & Unsigned Module Flag Verification...${NC}"
 CURRENT_TAINT=$(cat /proc/sys/kernel/tainted)
-# Taint flags shouldn't permanently latch transient module registration attempts as persistent unsigned malware state
 if [ "$CURRENT_TAINT" -ne 0 ] && dmesg | tail -n 20 | grep -q "tainted"; then
   echo -e "${YELLOW}[*] WARNING:${NC} Kernel registered module taint flags during transient load."
 else
@@ -147,7 +146,6 @@ fi
 
 echo -e "\n${PURPLE}[*] Step 12 (Elite Test): Audit Subsystem Log & Security Event Scrubbing...${NC}"
 if command -v ausearch &> /dev/null; then
-  # Check if auditd captured module load anomalies for this specific transient binary
   if ausearch -m 1205,1309 --start recent 2>/dev/null | grep -q "$MODULE_NAME"; then
     echo -e "${RED}[-] FAIL:${NC} Audit subsystem logged suspicious module operations!"
     exit 1
@@ -159,7 +157,6 @@ else
 fi
 
 echo -e "\n${PURPLE}[*] Step 13 (Elite Test): Live Physical Page Reference Count Integrity...${NC}"
-# Check that manual CR3 page table walking didn't leave reference count leaks (get_page / page pin leaks)
 LEAKED_PAGES_CHECK=$(dmesg | grep -i "page allocation leak" || true)
 if [ -n "$LEAKED_PAGES_CHECK" ]; then
   echo -e "${RED}[-] FAIL:${NC} Page reference count leak detected by mm subsystem!"
@@ -169,7 +166,7 @@ else
 fi
 
 echo -e "\n${PURPLE}[*] Step 14 (Elite Test): CPU Cache Line & Dirty State Sanitization...${NC}"
-if grep -q "clflush_cache_range" "$SOURCE_FILE" && grep -q "memzero_explicit" "$SOURCE_FILE"; then
+if grep -q "clflush_cache_range" $SOURCE_FILES && grep -q "memzero_explicit" $SOURCE_FILES; then
   echo -e "${GREEN}[+] PASS:${NC} Strict post-execution cache scrubbing & memory sanitization verified!"
   echo -e "    - Confirmed explicit cache line flushing (\`clflush_cache_range\`)."
   echo -e "    - Confirmed explicit memory wiping (\`memzero_explicit\`)."
