@@ -12,11 +12,12 @@
 
 The toolkit relies on six distinct architectural pillars to ensure absolute operational stealth, universal compatibility, and execution integrity:
 
-### 1. Universal PCI ABAR Resolution & Fallback Engine
+### 1. MMIO Piggybacking & Universal ABAR Resolution
 
-Traditional hardcoded physical addresses or fragile driver-state lookups often fail across different virtualized environments (e.g., VirtualBox, QEMU/KVM) or diverse bare-metal motherboards.
+To interact with the AHCI controller's memory space without creating new telemetry footprints or conflicting with active kernel driver mappings, the toolkit utilizes an advanced MMIO discovery pipeline:
 
-* **The Algorithm:** The module scans all available PCI devices on the bus, inspecting their base classes (`Base Class 0x01` for Mass Storage Controllers). Upon discovering a matching storage controller, it dynamically extracts the BAR5 (ABAR) physical address using standard kernel APIs (`pci_resource_start()`) and maps it safely via `ioremap()`. If hypervisor quirks or firmware limitations obscure the dynamic scan, the engine automatically falls back to standard virtualization memory maps (such as the VirtualBox ICH9 ABAR at `0xe1900000ULL`), ensuring 100% reliability.
+* **The Piggybacked Approach (`host->iomap`):** Initially designed to completely avoid manual `ioremap()` calls, this technique iterates through active PCI SATA controllers, retrieves the driver data state (`pci_get_drvdata`), and hooks directly into `host->iomap[5]`. This leverages the pre-existing virtual address space already mapped by `libata` during system boot.
+* **Universal PCI Scanner & Fallback Engine:** To handle kernel version differences or hypervisor environments where internal driver structures vary, the framework incorporates a universal bus scanner. It inspects all Mass Storage controllers (`Base Class 0x01`), dynamically resolves BAR5 via `pci_resource_start()`, and falls back to hypervisor-aware memory maps (such as VirtualBox ICH9 ABAR at `0xe1900000ULL`) when necessary.
 
 ### 2. Pure-MMIO Execution Engine (Bypassing `libata`)
 
@@ -51,14 +52,3 @@ Advanced memory dumpers and cold-boot forensic tools can recover sensitive paylo
   * **Cache Flushing:** Employs `clflush_cache_range()` to forcefully push dirty cache lines out to physical RAM and invalidate L1/L2/L3 CPU caches.
   * **Explicit Memory Wiping:** Uses `memzero_explicit()` to securely overwrite all allocation pages and command headers with zeroes, ensuring no compiler optimizations eliminate the wipe.
   * **Link Noise Elimination:** Reads and clears the Port Error Register (`PxSERR`) and pending interrupt flags (`PxIS`) post-execution to prevent `libata` from throwing `qc_active` warning artifacts when the physical link re-synchronizes.
-
----
-
-## Project Structure
-
-```text
-ahci-dco-exploitation/
-├── ahci_cmd_builder.c   # Core transient pure-MMIO kernel module with Universal PCI Scanner
-├── Makefile             # Kernel module compilation targets
-├── krun.sh              # Automated build, transient injection & verification suite
-└── README.md            # Project documentation

