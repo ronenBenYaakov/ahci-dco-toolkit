@@ -65,20 +65,47 @@ ahci-dco-exploitation/
 
 ## Automation & Verification Suite (`krun.sh`)
 
-The included automation script handles compilation, transient execution, module hiding validation, `dmesg` link-noise auditing, and memory forensics verification with structured color-coding:
+The framework includes a fully automated testing suite (`krun.sh`) that compiles the transient module, injects it, audits module invisibility, parses kernel telemetry, and verifies memory forensics defenses with vibrant color-coding.
+
+Run the suite with root privileges:
 
 ```bash
 sudo ./krun.sh
 
 ```
 
-### What the Script Verifies:
+### Sample Execution Output
 
-1. **Compilation:** Clean build of `ahci_cmd_builder.ko`.
-2. **Transient Execution:** Asserts that `insmod` returns `-ENODEV` upon successful task completion.
-3. **Module Hiding Check:** Confirms `lsmod` returns no trace of the module.
-4. **Radar Audit:** Parses kernel ring buffers (`dmesg`) for DCO execution success signatures and verifies the absence of `qc_active` link warnings.
-5. **Memory Forensics Validation:** Verifies active CPU cache line flushing (`clflush_cache_range`) and RAM sanitization (`memzero_explicit`).
+```text
+╔══════════════════════════════════════════════════════╗
+║        AHCI PURE MMIO STEALTH DCO TEST SUITE         ║
+╚══════════════════════════════════════════════════════╝
+
+[*] Step 1: Compiling kernel module (ahci_cmd_builder.ko)...
+[+] BUILD SUCCESSFUL: Compilation clean and verified.
+
+[*] Step 2: Injecting module (Transient Stealth Mode)...
+insmod: ERROR: could not insert module ./ahci_cmd_builder.ko: No such device
+[+] EXECUTION COMPLETE: Module ran and self-aborted registration as designed.
+
+[*] Step 3: Verifying Module Hiding (lsmod Footprint)...
+[+] PASS: Module is completely invisible in lsmod (Zero Resident Footprint).
+
+[*] Step 4: Auditing Kernel Logs & Link Noise (dmesg)...
+[+] PASS: DCO micro-trim command executed and confirmed by hardware.
+[+] PASS: Zero link noise, bus errors, or qc_active warnings detected.
+    (The PxSERR cleanup successfully blinded the kernel storage driver.)
+
+[*] Step 5: Validating Memory Forensics & Cache Sanitization...
+[+] PASS: clflush_cache_range detected: CPU cache lines are actively flushed.
+[+] PASS: memzero_explicit detected: Physical RAM buffers are securely zeroed.
+[+] PASS: Memory Forensics Layer defense verified (No residue left in RAM or CPU cache).
+
+╔══════════════════════════════════════════════════════╗
+║        ALL STEALTH & FORENSIC CHECKS PASSED!         ║
+╚══════════════════════════════════════════════════════╝
+
+```
 
 ---
 
