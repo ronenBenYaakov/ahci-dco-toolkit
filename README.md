@@ -47,11 +47,9 @@ To ensure complete out-of-band execution without triggering asynchronous system 
 * **Global Interrupt Enable (IE) Cleansing:** Reads the Global Host Control register (`AHCI_GHC`) and clears the Global Interrupt Enable bit (`GHC_IE`).
 * **Wire Isolation:** Suppresses legacy wire interrupts at the controller core level, allowing the polling engine to operate in complete isolation.
 
-### 6. Hardware Interrupt Masking (`PxIE` Blinding) & Polling
+### 6. Low-Level Port & Interrupt Quiescence Engine (`suppress_interrupts_adaptive`)
 
-The Linux kernel monitors drive activity primarily through hardware interrupts handled by `libata`.
-
-* **The Algorithm:** Immediately before issuing a command, the module backs up and zeroes out the Port Interrupt Enable (`PxIE`) register. This commands the AHCI controller to withhold all completion interrupts from the CPU. The framework then executes an active polling loop against the Task File Data (`PxTFD`) and Command Issue (`PxCI`) registers to monitor completion out-of-band.
+Instead of relying on high-level kernel hooks, this mechanism bypasses standard APIs to perform direct hardware-level interrupt suppression and vector masking via raw port I/O and direct MMIO traversal, silently blinding MSI/MSI-X capabilities and clearing global/port interrupt gates.
 
 ### 7. Transient Execution (Zero-Resident Module Footprint)
 

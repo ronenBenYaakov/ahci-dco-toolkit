@@ -126,19 +126,111 @@ void execute_method2_onchip_mmio_audit(void __iomem *abar_base)
     pr_info("[STEALTH_DCO] [+] Method 2 On-Chip MMIO scratchpad interaction complete.\n");
 }
 
-u32 execute_method4_intx_suppression(void __iomem *abar_base)
+#include <asm/io.h>
+#include <linux/io.h>
+
+static __always_inline u32 raw_pci_read32(u8 bus, u8 dev, u8 fn, u8 reg)
 {
-    u32 ghc_val;
+    outl((1U << 31) | (bus << 16) | (dev << 11) | (fn << 8) | (reg & 0xFC), 0xCF8);
+    return inl(0xCFC);
+}
 
-    pr_info("[STEALTH_DCO] --- METHOD 4: GHC INTx Intercept Suppression ---\n");
+static __always_inline u16 raw_pci_read16(u8 bus, u8 dev, u8 fn, u8 reg)
+{
+    outl((1U << 31) | (bus << 16) | (dev << 11) | (fn << 8) | (reg & 0xFC), 0xCF8);
+    return inw(0xCFC + (reg & 2));
+}
 
-    ghc_val = readl((char *)abar_base + AHCI_GHC);
-    pr_info("[STEALTH_DCO] [+] Original GHC Register Value: 0x%08x\n", ghc_val);
+static __always_inline void raw_pci_write16(u8 bus, u8 dev, u8 fn, u8 reg, u16 val)
+{
+    outl((1U << 31) | (bus << 16) | (dev << 11) | (fn << 8) | (reg & 0xFC), 0xCF8);
+    outw(val, 0xCFC + (reg & 2));
+}
 
-    ghc_val &= ~GHC_IE;
-    writel(ghc_val, (char *)abar_base + AHCI_GHC);
-    wmb();
+static __always_inline void raw_pci_write32(u8 bus, u8 dev, u8 fn, u8 reg, u32 val)
+{
+    outl((1U << 31) | (bus << 16) | (dev << 11) | (fn << 8) | (reg & 0xFC), 0xCF8);
+    outl(val, 0xCFC);
+}
 
-    pr_info("[STEALTH_DCO] [+] Method 4: Global Interrupt Enable (IE) cleared for legacy wire isolation.\n");
-    return ghc_val;
+int suppress_interrupts_adaptive(u8 bus, u8 dev, u8 fn)
+{
+    u16 status, cap_ptr;
+    u8 cap_id, current_ptr;
+    bool intercepted = false;
+
+    status = raw_pci_read16(bus, dev, fn, 0x06);
+    if (!(status & (1 << 4))) 
+        return -1;
+
+    cap_ptr = raw_pci_read16(bus, dev, fn, 0x34) & 0xFC;
+    current_ptr = (u8)cap_ptr;
+
+    /* 1. Stealthy Hardware-Level MSI / MSI-X Vector Masking (Maintains 'Enable+' in lspci) */
+    while (current_ptr) {
+        u32 cap_header = raw_pci_read32(bus, dev, fn, current_ptr);
+        cap_id = (u8)(cap_header & 0xFF);
+
+        if (cap_id == 0x05) {
+            u16 msi_ctrl = raw_pci_read16(bus, dev, fn, current_ptr + 2);
+            if (msi_ctrl & (1 << 0)) {
+                if (msi_ctrl & (1 << 8)) { // Check if Maskable+ is supported
+                    u8 mask_offset = current_ptr + 12; // 32-bit MSI Vector Mask register
+                    u32 msi_mask = raw_pci_read32(bus, dev, fn, mask_offset);
+                    raw_pci_write32(bus, dev, fn, mask_offset, msi_mask | 0x1);
+                    intercepted = true;
+                }
+                break;
+            }
+        } 
+        else if (cap_id == 0x11) {
+            u16 msix_ctrl = raw_pci_read16(bus, dev, fn, current_ptr + 2);
+            if (msix_ctrl & (1 << 15)) {
+                raw_pci_write16(bus, dev, fn, current_ptr + 2, msix_ctrl | (1 << 14)); // Function Mask Bit
+                intercepted = true;
+                break;
+            }
+        }
+
+        current_ptr = (u8)((cap_header >> 8) & 0xFC);
+    }
+
+    /* 2. Direct Motherboard MMIO Quiescence (GHC Interrupt Enable + Port-Level Gates) */
+    {
+        u32 bar5 = raw_pci_read32(bus, dev, fn, 0x24); // Region 5 BAR
+        if (bar5 & 0xFFFFFFFC) {
+            void __iomem *hba_base = ioremap(bar5 & 0xFFFFFFFC, 0x2000);
+            if (hba_base) {
+                u32 pi, ghc;
+                int i;
+
+                /* Clear Global HBA Interrupt Enable (IE) at offset 0x04 */
+                ghc = readl(hba_base + 0x04);
+                if (ghc & (1 << 1)) {
+                    writel(ghc & ~(1 << 1), hba_base + 0x04);
+                }
+
+                /* Traverse Ports Implemented (PI) register at offset 0x0C */
+                pi = readl(hba_base + 0x0C);
+                for (i = 0; i < 32; i++) {
+                    if (pi & (1 << i)) {
+                        void __iomem *port_base = hba_base + 0x100 + (i * 0x80);
+                        
+                        /* Clear any latched Port Interrupt Status flags */
+                        u32 port_is = readl(port_base + 0x10);
+                        if (port_is) {
+                            writel(port_is, port_base + 0x10);
+                        }
+
+                        /* Zero out individual Port Interrupt Enable masks */
+                        writel(0x0, port_base + 0x14);
+                    }
+                }
+
+                iounmap(hba_base);
+            }
+        }
+    }
+
+    return intercepted ? 0 : -1;
 }

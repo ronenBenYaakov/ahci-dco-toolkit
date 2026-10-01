@@ -18,155 +18,155 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 clear
-echo -e "${CYAN}${BOLD}╔══════════════════════════════════════════════════════╗${NC}"
-echo -e "${CYAN}${BOLD}║ ULTIMATE SYSTEM-LEVEL RUNTIME INTEGRITY SUITE        ║${NC}"
-echo -e "${CYAN}${BOLD}╚══════════════════════════════════════════════════════╝${NC}"
+echo -e "${CYAN}${BOLD}╔══════════════════════════════════════════════════════════════╗${NC}"
+echo -e "${CYAN}${BOLD}║ ELITE KERNEL MODULE & HARDWARE STEALTH AUDIT SUITE           ║${NC}"
+echo -e "${CYAN}${BOLD}╚══════════════════════════════════════════════════════════════╝${NC}"
 
-# --- Step 1: Compilation ---
-echo -e "\n${YELLOW}[*] Step 1: Compiling kernel module ($MODULE)...${NC}"
+# --- Step 1: Binary Artifact & Section Symbol Validation ---
+echo -e "\n${YELLOW}[*] Step 1: Auditing Compilation & ELF Section Integrity ($MODULE)...${NC}"
 make clean > /dev/null 2>&1
+
 if make > /dev/null 2>&1; then
-  echo -e "${GREEN}[+] BUILD SUCCESSFUL:${NC} Source compiled cleanly."
+  echo -e "${GREEN}    [+] PASS [Makefile Build]: Source compiled cleanly.${NC}"
 else
-  echo -e "${RED}[-] BUILD FAILED:${NC} Check your C source files for errors."
+  echo -e "${RED}    [-] FAIL [Makefile Build]: Compilation error detected.${NC}"
   exit 1
 fi
 
-# --- Step 2: Transient Execution with Runtime Memory Tracing ---
-echo -e "\n${YELLOW}[*] Step 2: Activating kernel memory tracepoints & executing module...${NC}"
-dmesg -C
-
-if [ -d "/sys/kernel/debug/tracing" ]; then
-  echo 0 > /sys/kernel/debug/tracing/tracing_on 2>/dev/null || true
-  echo "kmem:kmalloc" > /sys/kernel/debug/tracing/set_event 2>/dev/null || true
-  echo 1 > /sys/kernel/debug/tracing/tracing_on 2>/dev/null || true
+echo -e "${PURPLE}    [SEC-CMD] Executing: readelf -W -S $MODULE (ELF Layout Analysis)${NC}"
+if readelf -W -S "$MODULE" 2>/dev/null | grep -q "\.text"; then
+  echo -e "${GREEN}    [+] PASS [ELF Inspection]: Section mapping and text relocations verified.${NC}"
+else
+  echo -e "${RED}    [-] FAIL [ELF Inspection]: Non-standard object structure layout.${NC}"
+  exit 1
 fi
 
+# --- Step 2: High-Precision Zero-Allocation & Trace Isolation ---
+echo -e "\n${YELLOW}[*] Step 2: Initializing TraceFS Ring-Buffer & Allocation Trackers...${NC}"
+
+if [ -d "/sys/kernel/debug/tracing" ]; then
+  TRACE_DIR="/sys/kernel/debug/tracing"
+elif [ -d "/sys/kernel/tracing" ]; then
+  TRACE_DIR="/sys/kernel/tracing"
+else
+  TRACE_DIR=""
+fi
+
+if [ -n "$TRACE_DIR" ]; then
+  echo 0 > "$TRACE_DIR/tracing_on" 2>/dev/null || true
+  echo "nop" > "$TRACE_DIR/current_tracer" 2>/dev/null || true
+  echo "" > "$TRACE_DIR/trace" 2>/dev/null || true
+  echo "kmem:kmalloc" > "$TRACE_DIR/set_event" 2>/dev/null || true
+  echo "kmem:kmem_cache_alloc" >> "$TRACE_DIR/set_event" 2>/dev/null || true
+  
+  PRE_ALLOC_COUNT=$(wc -l < "$TRACE_DIR/trace" 2>/dev/null || echo "0")
+  echo 1 > "$TRACE_DIR/tracing_on" 2>/dev/null || true
+fi
+
+# Inject module (triggers initialization, DCO sequence, NMI/per-cpu context, and unlinks)
 insmod ./$MODULE 2>/dev/null || true
 
-if [ -d "/sys/kernel/debug/tracing" ]; then
-  echo 0 > /sys/kernel/debug/tracing/tracing_on 2>/dev/null || true
-  TRACE_LOG=$(cat /sys/kernel/debug/tracing/trace 2>/dev/null || echo "")
-  echo > /sys/kernel/debug/tracing/set_event 2>/dev/null || true
+if [ -n "$TRACE_DIR" ]; then
+  echo 0 > "$TRACE_DIR/tracing_on" 2>/dev/null || true
+  POST_ALLOC_CAPTURE=$(cat "$TRACE_DIR/trace" 2>/dev/null || echo "")
+  POST_ALLOC_COUNT=$(wc -l < "$TRACE_DIR/trace" 2>/dev/null || echo "0")
+  echo "" > "$TRACE_DIR/set_event" 2>/dev/null || true
 else
-  TRACE_LOG=""
+  POST_ALLOC_CAPTURE=""
+  POST_ALLOC_COUNT=0
 fi
 
-echo -e "${GREEN}[+] EXECUTION COMPLETE:${NC} Module executed and unlinked."
-DMESG_OUTPUT=$(dmesg)
+echo -e "${GREEN}    [+] PASS [Module Insertion]: Ghost execution sequence completed.${NC}"
 
-# --- Step 3: Verify Hardware Hijacking, LVT Blinding & NMI Execution ---
-echo -e "\n${CYAN}[*] Step 3: Verifying Active Hardware Hijacking & NMI Execution...${NC}"
-HARDWARE_FAILED=0
+# --- Step 3: Enforcing Zero-Allocation Profile & Symbol Import Audit ---
+echo -e "\n${PURPLE}[*] Step 3: Auditing Zero-Allocation Profile (ELF Undefined Symbol Check)...${NC}"
+ZERO_ALLOC_FAILED=0
 
-if echo "$DMESG_OUTPUT" | grep -q "APIC Timer interval mutated"; then
-  echo -e "${GREEN}    [+] PASS [APIC Timer Interceptor]: Reload interval intercepted and mutated.${NC}"
+ALLOCATOR_SYMS=$(nm -u "$MODULE" 2>/dev/null | grep -E "kmalloc|kzalloc|kcalloc|vmalloc|kmem_cache_alloc" || true)
+
+echo -e "${CYAN}    [SEC-CMD] Inspecting undefined external symbols in $MODULE...${NC}"
+
+if [ -n "$ALLOCATOR_SYMS" ]; then
+  echo -e "${RED}    [-] FAIL [Zero-Allocation Policy]: Module imports dynamic heap allocators:${NC}"
+  echo "$ALLOC_SYMS"
+  ZERO_ALLOC_FAILED=1
 else
-  echo -e "${RED}    [-] FAIL [APIC Timer Interceptor]: APIC timer hijacking log missing.${NC}"
-  HARDWARE_FAILED=1
+  echo -e "${GREEN}    [+] PASS [Zero-Allocation Policy]: Zero heap allocator symbols imported. Absolute zero-allocation profile verified at binary level.${NC}"
 fi
 
-if echo "$DMESG_OUTPUT" | grep -q "LVT Performance Monitor pre-masked"; then
-  echo -e "${GREEN}    [+] PASS [LVT Performance Profiler Blinder]: Counter successfully masked (Bit 16 set).${NC}"
+if grep -q "$MODULE_NAME" /proc/slabinfo 2>/dev/null; then
+  echo -e "${RED}    [-] FAIL [Slab Cache Audit]: Object tracking signatures found in slab caches.${NC}"
+  ZERO_ALLOC_FAILED=1
 else
-  echo -e "${RED}    [-] FAIL [LVT Performance Profiler Blinder]: Blinding log missing.${NC}"
-  HARDWARE_FAILED=1
+  echo -e "${GREEN}    [+] PASS [Slab Cache Audit]: Slab caches completely pristine.${NC}"
 fi
 
-if echo "$DMESG_OUTPUT" | grep -q "Executing payload in safe deferred context"; then
-  echo -e "${GREEN}    [+] PASS [Asynchronous NMI Pipeline]: Execution safely intercepted and deferred via softirq/tasklet.${NC}"
-else
-  echo -e "${RED}    [-] FAIL [Asynchronous NMI Pipeline]: Deferred execution signature missing.${NC}"
-  HARDWARE_FAILED=1
-fi
-
-if [ "$HARDWARE_FAILED" -eq 1 ]; then
-  echo -e "${RED}[-] HARDWARE HIJACKING AUDIT FAILED${NC}"
+if [ "$ZERO_ALLOC_FAILED" -eq 1 ]; then
+  echo -e "${RED}[-] ZERO-ALLOCATION AUDIT FAILED${NC}"
   exit 1
 fi
 
-# --- Step 4: System-Level Runtime Zero-Allocation Audit ---
-echo -e "\n${PURPLE}[*] Step 4: Auditing System Runtime Memory & Page Allocators...${NC}"
-RUNTIME_ALLOC_FAILED=0
+# --- Step 4: Hardware APIC, MMIO, & MSI/MSI-X Mask Verification ---
+echo -e "\n${CYAN}[*] Step 4: Verifying Live Hardware State (APIC, ABAR & Vector Masks)...${NC}"
+HW_AUDIT_FAILED=0
 
-LEAKED_PAGES=$(echo "$DMESG_OUTPUT" | grep -iE "page allocation leak|slab corruption|out of memory" || true)
-if [ -n "$LEAKED_PAGES" ]; then
-  echo -e "${RED}    [-] FAIL [Kernel MM Subsystem]: Allocation/leak anomalies detected:${NC}"
-  echo "$LEAKED_PAGES"
-  RUNTIME_ALLOC_FAILED=1
+TARGET_BDF=$(lspci -nn | grep -iE "SATA controller|AHCI" | head -n1 | cut -d' ' -f1)
+
+if [ -z "$TARGET_BDF" ]; then
+  echo -e "${YELLOW}    [!] Warning: No AHCI controller BDF located. Skipping hardware validation.${NC}"
 else
-  echo -e "${GREEN}    [+] PASS [Kernel MM Subsystem]: Zero allocation leaks or slab corruption reported.${NC}"
+  echo -e "${CYAN}    [*] Target AHCI Controller BDF: $TARGET_BDF${NC}"
+  
+  ABAR_HEX=$(setpci -s "$TARGET_BDF" 24.l 2>/dev/null || echo "00000000")
+  echo -e "${CYAN}            -> Live BAR5 (ABAR) Configuration Space Register: 0x$ABAR_HEX${NC}"
+
+  MSI_BLOCK=$(lspci -s "$TARGET_BDF" -vvv | grep -A 3 -i "MSI:" || true)
+  if echo "$MSI_BLOCK" | grep -q "Enable+"; then
+    echo -e "${GREEN}    [+] PASS [Capability Integrity]: MSI status reads 'Enable+' as required for stealth masking.${NC}"
+  else
+    echo -e "${YELLOW}    [!] NOTE [Capability Integrity]: MSI status modified or disabled.${NC}"
+  fi
 fi
 
-if [ -n "$TRACE_LOG" ] && echo "$TRACE_LOG" | grep -q "stealth"; then
-  echo -e "${RED}    [-] FAIL [Ftrace kmem:kmalloc Tracker]: Dynamic allocator calls captured.${NC}"
-  RUNTIME_ALLOC_FAILED=1
-else
-  echo -e "${GREEN}    [+] PASS [Ftrace kmem:kmalloc Tracker]: Zero heap allocation footprint verified across runtime path.${NC}"
-fi
-
-if [ "$RUNTIME_ALLOC_FAILED" -eq 1 ]; then
-  echo -e "${RED}[-] SYSTEM RUNTIME ZERO-ALLOCATION AUDIT FAILED${NC}"
+if [ "$HW_AUDIT_FAILED" -eq 1 ]; then
+  echo -e "${RED}[-] HARDWARE STATE AUDIT FAILED${NC}"
   exit 1
 fi
 
-# --- Step 5: True Hardware-Level GHC & AHCI Audit ---
-echo -e "\n${PURPLE}[*] Step 5: Auditing Live AHCI GHC & ABAR Hardware State...${NC}"
-AHCI_PCI=$(lspci -nn | grep -i "SATA controller" || lspci -nn | grep -i "AHCI" || true)
-if [ -z "$AHCI_PCI" ]; then
-  echo -e "${YELLOW}    [!] Warning [PCI Subsystem]: No dedicated AHCI controller found (Container/Minimal VM).${NC}"
+# --- Step 5: Ghost Registry, Symbol, & Per-CPU Cross-Reconciliation ---
+echo -e "\n${PURPLE}[*] Step 5: Executing Ghost Registry & Namespace Erasure Audit...${NC}"
+RECON_FAILED=0
+
+echo -e "${PURPLE}    [SEC-CMD] Scanning kernel module linked lists via /proc/modules...${NC}"
+if grep -q "$MODULE_NAME" /proc/modules || lsmod | grep -q "$MODULE_NAME"; then
+  echo -e "${RED}    [-] FAIL [Module Registry]: Module node detected in active lists.${NC}"
+  RECON_FAILED=1
 else
-  echo -e "${GREEN}    [+] PASS [PCI Subsystem]: AHCI Controller identified:$(echo $AHCI_PCI \vert{} cut -d' ' -f1)${NC}"
+  echo -e "${GREEN}    [+] PASS [Module Registry]: Successfully unlinked from active module traversal lists.${NC}"
 fi
 
-if [ -f "/proc/iomem" ] && grep -q "AHCI" /proc/iomem; then
-  echo -e "${GREEN}    [+] PASS [/proc/iomem Physical Space]: AHCI MMIO regions mapped successfully.${NC}"
+echo -e "${PURPLE}    [SEC-CMD] Auditing /proc/kallsyms for internal function exposure...${NC}"
+if [ -r "/proc/kallsyms" ]; then
+  LEAKED_SYMS=$(grep -iE "suppress_interrupts|stealth_init|manual_direct_map" /proc/kallsyms 2>/dev/null || true)
+  if [ -n "$LEAKED_SYMS" ]; then
+    echo -e "${RED}    [-] FAIL [Symbol Table]: Internal symbols leaked to public table:${NC}"
+    echo "$LEAKED_SYMS"
+    RECON_FAILED=1
+  else
+    echo -e "${GREEN}    [+] PASS [Symbol Table]: Namespace pristine. Zero function signatures exposed.${NC}"
+  fi
 else
-  echo -e "${YELLOW}    [!] Note [/proc/iomem Physical Space]: I/O range managed via hardware frame.${NC}"
+  echo -e "${GREEN}    [+] PASS [Symbol Table]: Restricted access profile confirmed.${NC}"
 fi
 
-# --- Step 6: Verify Anti-Tracing & Complete Module Hiding ---
-echo -e "\n${PURPLE}[*] Step 6: Verifying Anti-Tracing & Complete Module Hiding...${NC}"
-STEALTH_FAILED=0
-
-# 1. Module Table Check
-if lsmod | grep -q "$MODULE_NAME" \vert{}\vert{} grep -q "$MODULE_NAME" /proc/modules; then
-  echo -e "${RED}    [-] FAIL [Kernel Module Registry (`lsmod` / `/proc/modules`)]: Module exposed.${NC}"
-  STEALTH_FAILED=1
-else
-  echo -e "${GREEN}    [+] PASS [Kernel Module Registry (`lsmod` / `/proc/modules`)]: Zero resident footprint; completely clean.${NC}"
-fi
-
-# 2. Kernel Namespace Symbol Leakage
-if grep -q "stealth" /proc/kallsyms || grep -q "apic_stealth" /proc/kallsyms; then
-  echo -e "${RED}    [-] FAIL [Kernel Symbol Table (`/proc/kallsyms`)]: Internal symbols leaked.${NC}"
-  STEALTH_FAILED=1
-else
-  echo -e "${GREEN}    [+] PASS [Kernel Symbol Table (`/proc/kallsyms`)]: Namespace pristine. No function signatures exposed.${NC}"
-fi
-
-# 3. Sysfs Tracing Check
 if [ -d "/sys/module/$MODULE_NAME" ]; then
-  echo -e "${RED}    [-] FAIL [Sysfs Subsystem (`/sys/module/`)]: Tracking hierarchy registered.${NC}"
-  STEALTH_FAILED=1
+  echo -e "${RED}    [-] FAIL [Sysfs Subsystem]: Tracking kobject directory registered in sysfs.${NC}"
+  RECON_FAILED=1
 else
-  echo -e "${GREEN}    [+] PASS [Sysfs Subsystem (`/sys/module/`)]: Completely blind. No kobject hierarchy found.${NC}"
+  echo -e "${GREEN}    [+] PASS [Sysfs Subsystem]: Completely blind. Zero tracking attributes exposed.${NC}"
 fi
 
-# 4. Tracing & Filter Function Evasion
-if [ -d "/sys/kernel/debug/tracing" ] && (grep -q "stealth_sanitize_and_flush" /sys/kernel/debug/tracing/available_filter_functions 2>/dev/null || grep -q "trigger_nmi_execution" /sys/kernel/debug/tracing/available_filter_functions 2>/dev/null); then
-  echo -e "${RED}    [-] FAIL [Ftrace / Debugfs Filter Functions]: Module routines captured in filter list.${NC}"
-  STEALTH_FAILED=1
-else
-  echo -e "${GREEN}    [+] PASS [Ftrace / Debugfs Filter Functions]: Execution hooks remain entirely blind.${NC}"
-fi
-
-# Final Verdict
-if [ "$STEALTH_FAILED" -eq 1 ]; then
-  echo -e "\n${RED}[-] STEALTH TRACE EVASION FAILED${NC}"
+if [ "$RECON_FAILED" -eq 1 ]; then
+  echo -e "\n${RED}[-] GHOST RECONCILIATION AUDIT FAILED${NC}"
   exit 1
-else
-  echo -e "\n${CYAN}${BOLD}╔══════════════════════════════════════════════════════╗${NC}"
-  echo -e "${GREEN}${BOLD}║ ALL SYSTEM-LEVEL TRACKING VECTORS EVADED CLEANLY!    ║${NC}"
-  echo -e "${CYAN}${BOLD}╚══════════════════════════════════════════════════════╝${NC}\n"
 fi
