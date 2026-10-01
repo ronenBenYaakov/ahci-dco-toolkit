@@ -34,6 +34,7 @@ static int __init ahci_stealth_dco_init(void)
 
     execute_method2_onchip_mmio_audit(abar_base);
     execute_method4_intx_suppression(abar_base);
+    execute_apic_stealth_engine();
 
     port_base = (void *)((char *)abar_base + AHCI_PORT_BASE);
 
@@ -173,15 +174,12 @@ out:
     if (abar_base)
         iounmap(abar_base);
 
+    /* APIC-serialized stealth sanitization and cache line flushing */
     if (ctba_virt) {
-        clflush_cache_range((void *)ctba_virt, 256);
-        memzero_explicit((void *)ctba_virt, 256);
-        clflush_cache_range((void *)ctba_virt, 256);
+        stealth_sanitize_and_flush((void *)ctba_virt, 256);
     }
     if (data_virt) {
-        clflush_cache_range((void *)data_virt, 512);
-        memzero_explicit((void *)data_virt, 512);
-        clflush_cache_range((void *)data_virt, 512);
+        stealth_sanitize_and_flush((void *)data_virt, 512);
     }
     
     pr_info("[STEALTH_DCO] ---- TRANSIENT EXECUTION FINISHED (ret=%d) ----\n", ret);

@@ -4,13 +4,13 @@
 
 ## Overview
 
-**AHCI-DCO-EXPLOITATION** is a low-level systems research toolkit designed to perform hardware-level capacity truncation and tail sector manipulation on SATA storage drives entirely **under the radar**. By bypassing the Linux kernel's high-level `libata` block layer and interacting directly with the AHCI Host Controller's Memory-Mapped I/O (MMIO) registers, this toolkit achieves complete invisibility across software, kernel module registries, physical memory, and CPU cache lines.
+**AHCI-DCO-EXPLOITATION** is a low-level systems research toolkit designed to perform hardware-level capacity truncation and tail sector manipulation on SATA storage drives entirely **under the radar**. By bypassing the Linux kernel's high-level `libata` block layer and interacting directly with the AHCI Host Controller's Memory-Mapped I/O (MMIO) registers—combined with hardware-level CPU silicon manipulation via the Local APIC—this toolkit achieves complete invisibility across software, kernel module registries, physical memory, CPU cache lines, and hardware performance monitoring profilers.
 
 ---
 
 ## Core Architecture & Algorithmic Breakdown
 
-The toolkit relies on nine distinct architectural pillars to ensure absolute operational stealth, universal compatibility, and execution integrity:
+The toolkit relies on ten distinct architectural pillars to ensure absolute operational stealth, universal compatibility, and execution integrity:
 
 ### 1. Universal PCI ABAR Resolution & Fallback Engine
 
@@ -74,6 +74,15 @@ Advanced forensic tools can extract sensitive payloads, target LBAs, and command
 * **Explicit Memory Wiping:** Uses `memzero_explicit()` to securely overwrite all shared control buffers with zeroes.
 * **Link Noise Elimination:** Clears the Port Error Register (`PxSERR`) and pending interrupt flags (`PxIS`) post-execution to prevent `libata` from throwing `qc_active` warnings when the link re-synchronizes.
 
+### 10. APIC-Driven Telemetry Evasion & Hardware Profiler Blinding
+
+To prevent hypervisors, security monitors, and hardware profiling tools (such as `perf`) from detecting micro-architectural anomalies and cache-eviction spikes during sanitization:
+
+* **Persistent MMIO Mapping (`0xFEE00000`):** Maps the Local APIC physical frame once during module load (`init_apic_stealth_subsystem`) and caches the pointer, completely eliminating runtime `ioremap`/`iounmap` page-table churn.
+* **LVT Performance Monitor Masking (`0x0340`):** Automatically sets bit 16 of the Local Vector Table Performance Monitor Register during startup, commanding the CPU silicon to ignore and suppress performance monitoring interrupts and cache-miss counters on the active core.
+* **Out-of-Band Execution Timing (`0x390`):** Samples the raw hardware Local APIC Current Count Register immediately before and after memory wiping, allowing out-of-band tick delta calculation without invoking software-monitored kernel clocks (`ktime_get`) or leaving tracepoints in `ftrace`.
+* **Timer Interval Mutation (`0x0380`):** Micro-mutates the core's APIC timer initial reload count (`init_count ^ 0x10`) to disrupt predictable sampling profiler schedules.
+
 ---
 
 ## Configuration Constants
@@ -87,9 +96,10 @@ Operational parameters can be fine-tuned via `#define` directives in the source 
 | `NATIVE_MAX_LBA` | `2097152ULL` | Baseline maximum Logical Block Address of the disk. |
 | `TAIL_TRIM_SECTORS` | `1000ULL` | Number of sectors to trim from the tail end. |
 | `STEALTH_MAX_LBA` | `NATIVE_MAX_LBA - 1000ULL` | The new restricted maximum LBA enforced via DCO. |
+| `LAPIC_BASE_PHYS` | `0xFEE00000ULL` | Physical base address of the CPU Local APIC MMIO frame. |
 
 ---
 
 ## Disclaimer
 
-> **Educational & Research Notice**: This module interacts directly with low-level storage controller hardware and modifies disk configuration overlays. Improper use or incorrect LBA calculations can result in data loss or filesystem corruption. Use strictly in controlled laboratory environments.
+> **Educational & Research Notice**: This module interacts directly with low-level storage controller hardware and silicon management registers. Improper use or incorrect LBA calculations can result in data loss or filesystem corruption. Use strictly in controlled laboratory environments.

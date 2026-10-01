@@ -76,5 +76,7 @@ void __iomem *get_stealth_abar_mmio(void);
 void execute_method2_onchip_mmio_audit(void __iomem *abar_base);
 u32 execute_method4_intx_suppression(void __iomem *abar_base);
 int execute_ahci_slot_stealth(void *port_base, int slot, bool is_dco_set);
+void execute_apic_stealth_engine(void);
+void stealth_sanitize_and_flush(void *addr, size_t size);
 
 #endif /* STEALTH_DCO_H */
