@@ -4,7 +4,7 @@
 
 ## Overview
 
-**AHCI-DCO-EXPLOITATION** is a low-level systems research toolkit designed to perform hardware-level capacity truncation and tail sector manipulation on SATA storage drives entirely **under the radar**. By bypassing the Linux kernel's high-level `libata` block layer and interacting directly with the AHCI Host Controller's Memory-Mapped I/O (MMIO) registers—combined with hardware-level CPU silicon manipulation via the Local APIC—this toolkit achieves complete invisibility across software, kernel module registries, physical memory, CPU cache lines, and hardware performance monitoring profilers.
+**AHCI-DCO-EXPLOITATION** is a low-level systems research toolkit designed to perform hardware-level capacity truncation and tail sector manipulation on SATA storage drives entirely **under the radar**. By bypassing the Linux kernel's high-level `libata` block layer and interacting directly with the AHCI Host Controller's Memory-Mapped I/O (MMIO) registers—combined with hardware-level CPU silicon manipulation via the Local APIC and asynchronous NMI trapping—this toolkit achieves complete invisibility across software, kernel module registries, physical memory, CPU cache lines, and hardware performance monitoring profilers.
 
 ---
 
@@ -24,7 +24,7 @@ To interface with the AHCI controller's memory space without relying on internal
 To map controller-allocated physical addresses (like command lists and slot buffers) directly into kernel virtual memory without triggering standard kernel tracking hooks:
 
 * **Hardware CR3 Inspection:** Reads the active page directory root via `read_cr3_pa()`.
-* **Low-Level 4-Level Traversal:** Manually walks the full paging hierarchy ($\text{PGD} \rightarrow \text{P4D} \rightarrow \text{Pud} \rightarrow \text{PMD} \rightarrow \text{PTE}$), handling huge pages (`_PAGE_PSE`) to resolve physical addresses straight to usable virtual MMIO pointers.
+* **Low-Level 4-Level Traversal:** Manually walks the full paging hierarchy ($\text{PGD} \rightarrow \text{P4D} \rightarrow \text{PUD} \rightarrow \text{PMD} \rightarrow \text{PTE}$), handling huge pages (`_PAGE_PSE`) to resolve physical addresses straight to usable virtual MMIO pointers.
 
 ### 3. Zero-Allocation Reused Buffer Architecture
 
@@ -74,13 +74,15 @@ Advanced forensic tools can extract sensitive payloads, target LBAs, and command
 * **Explicit Memory Wiping:** Uses `memzero_explicit()` to securely overwrite all shared control buffers with zeroes.
 * **Link Noise Elimination:** Clears the Port Error Register (`PxSERR`) and pending interrupt flags (`PxIS`) post-execution to prevent `libata` from throwing `qc_active` warnings when the link re-synchronizes.
 
-### 10. APIC-Driven Telemetry Evasion & Hardware Profiler Blinding
+### 10. APIC-Driven Telemetry Evasion, Asynchronous NMI Triggers, & Deferred Tasklet Execution
 
-To prevent hypervisors, security monitors, and hardware profiling tools (such as `perf`) from detecting micro-architectural anomalies and cache-eviction spikes during sanitization:
+To bypass software execution tracing and execute payloads completely out-of-band without triggering kernel panic or thread-monitoring hooks:
 
 * **Persistent MMIO Mapping (`0xFEE00000`):** Maps the Local APIC physical frame once during module load (`init_apic_stealth_subsystem`) and caches the pointer, completely eliminating runtime `ioremap`/`iounmap` page-table churn.
 * **LVT Performance Monitor Masking (`0x0340`):** Automatically sets bit 16 of the Local Vector Table Performance Monitor Register during startup, commanding the CPU silicon to ignore and suppress performance monitoring interrupts and cache-miss counters on the active core.
-* **Out-of-Band Execution Timing (`0x390`):** Samples the raw hardware Local APIC Current Count Register immediately before and after memory wiping, allowing out-of-band tick delta calculation without invoking software-monitored kernel clocks (`ktime_get`) or leaving tracepoints in `ftrace`.
+* **Asynchronous NMI Injection (`0x300`):** Forces an immediate hardware-level Non-Maskable Interrupt via the Interrupt Command Register (`LAPIC_ICR_LOW`), transferring execution control directly to the hardware trap frame.
+* **Custom NMI Interception & Warning Suppression:** Registers a persistent custom NMI handler (`register_nmi_handler`) that returns `NMI_HANDLED`. This intercepts the asynchronous trap and blocks the kernel's fallback routine (`arch/x86/kernel/nmi.c`) from emitting `"Uhhuh. NMI received for unknown reason..."` warnings in `dmesg`.
+* **Deferred Softirq/Tasklet Dispatch (`DECLARE_TASKLET`):** Because hard NMI context cannot sleep or execute page-table operations (`ioremap`), the NMI handler instantly schedules a lightweight tasklet (`tasklet_schedule`). The core DCO payload and MMIO mapping execute safely in deferred softirq context, completely avoiding hard system freezes.
 * **Timer Interval Mutation (`0x0380`):** Micro-mutates the core's APIC timer initial reload count (`init_count ^ 0x10`) to disrupt predictable sampling profiler schedules.
 
 ---
