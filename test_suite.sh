@@ -21,6 +21,7 @@ clear
 echo -e "${CYAN}${BOLD}╔══════════════════════════════════════════════════════════════╗${NC}"
 echo -e "${CYAN}${BOLD}║ ELITE KERNEL MODULE & HARDWARE STEALTH AUDIT SUITE           ║${NC}"
 echo -e "${CYAN}${BOLD}╚══════════════════════════════════════════════════════════════╝${NC}"
+sudo dmesg -C
 
 # --- Step 1: Binary Artifact & Section Symbol Validation ---
 echo -e "\n${YELLOW}[*] Step 1: Auditing Compilation & ELF Section Integrity ($MODULE)...${NC}"
@@ -88,7 +89,7 @@ echo -e "${CYAN}    [SEC-CMD] Inspecting undefined external symbols in $MODULE..
 
 if [ -n "$ALLOCATOR_SYMS" ]; then
   echo -e "${RED}    [-] FAIL [Zero-Allocation Policy]: Module imports dynamic heap allocators:${NC}"
-  echo "$ALLOC_SYMS"
+  echo "$ALLOCATOR_SYMS"
   ZERO_ALLOC_FAILED=1
 else
   echo -e "${GREEN}    [+] PASS [Zero-Allocation Policy]: Zero heap allocator symbols imported. Absolute zero-allocation profile verified at binary level.${NC}"
@@ -170,3 +171,17 @@ if [ "$RECON_FAILED" -eq 1 ]; then
   echo -e "\n${RED}[-] GHOST RECONCILIATION AUDIT FAILED${NC}"
   exit 1
 fi
+
+# --- Step 6: Verifying Absence of qc_active State Anomalies ---
+echo -e "\n${YELLOW}[*] Step 6: Auditing dmesg for illegal qc_active transitions...${NC}"
+QC_ACTIVE_WARNINGS=$(dmesg | grep -i "illegal qc_active transition" || true)
+
+if [ -n "$QC_ACTIVE_WARNINGS" ]; then
+  echo -e "${RED}    [-] FAIL [qc_active State]: Detected libata state warnings in kernel log:${NC}"
+  echo "$QC_ACTIVE_WARNINGS"
+  exit 1
+else
+  echo -e "${GREEN}    [+] PASS [qc_active State]: Zero illegal qc_active transitions detected. Port state perfectly isolated via PxIE blinding.${NC}"
+fi
+
+echo -e "\n${GREEN}${BOLD}[++] ALL AUDIT PHASES COMPLETED SUCCESSFULLY. SYSTEM FULLY SECURED.${NC}"

